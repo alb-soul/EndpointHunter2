@@ -1,0 +1,547 @@
+package main
+
+// ============================================================
+// endpoint-hunter2 — extractor.go (patched)
+//
+// PERUBAHAN vs v1:
+//   * normaliseTemplateURL: regexp.MustCompile di-hoist ke package var
+//     (dulu compile tiap panggil → berat di file JS besar).
+//   * extractEndpoints: scan seluruh konten SEKALI per pola (bukan per-baris ×
+//     per-pola) + lineIndex untuk nomor baris. Ekstraksi param pakai WINDOW
+//     KARAKTER di sekitar match (bukan ±3 baris) → memperbaiki blowup pada JS
+//     minified (dulu: konteks = seluruh file, di-regex ulang PER match).
+// ============================================================
+
+import (
+	"fmt"
+	"net/url"
+	"regexp"
+	"strings"
+)
+
+// ─── Endpoint ─────────────────────────────────────────────────────────────────
+
+type Endpoint struct {
+	RawURL   string
+	AbsURL   string
+	Method   string
+	Params   []string
+	Source   string
+	Line     int
+	Interest string
+}
+
+// ─── Extraction Patterns ──────────────────────────────────────────────────────
+
+type ExtractionPattern struct {
+	Name          string
+	Regex         *regexp.Regexp
+	URLGroup      int
+	MethodGroup   int
+	DefaultMethod string
+}
+
+var extractionPatterns = []ExtractionPattern{
+	{
+		Name:          "fetch+method",
+		Regex:         regexp.MustCompile(`fetch\s*\(\s*` + bt + `([^` + bte + `\s]+)` + bt + `\s*,\s*\{[^}]*method\s*:\s*['"]([A-Za-z]+)['"]`),
+		URLGroup:      1,
+		MethodGroup:   2,
+		DefaultMethod: "GET",
+	},
+	{
+		Name:          "fetch",
+		Regex:         regexp.MustCompile(`\bfetch\s*\(\s*` + bt + `([^` + bte + `\s]{4,})` + bt),
+		URLGroup:      1,
+		DefaultMethod: "GET",
+	},
+	{
+		Name:          "axios.method",
+		Regex:         regexp.MustCompile(`\baxios\s*\.\s*(get|post|put|delete|patch|head|options)\s*\(\s*` + bt + `([^` + bte + `\s]{4,})` + bt),
+		URLGroup:      2,
+		MethodGroup:   1,
+		DefaultMethod: "GET",
+	},
+	{
+		Name:          "axios-config-url-method",
+		Regex:         regexp.MustCompile(`\baxios\s*\(\s*\{[^}]{0,200}url\s*:\s*` + bt + `([^` + bte + `\s]{4,})` + bt + `[^}]{0,200}method\s*:\s*['"]([A-Za-z]+)['"]`),
+		URLGroup:      1,
+		MethodGroup:   2,
+		DefaultMethod: "GET",
+	},
+	{
+		Name:          "axios-config-method-url",
+		Regex:         regexp.MustCompile(`\baxios\s*\(\s*\{[^}]{0,200}method\s*:\s*['"]([A-Za-z]+)['"]\s*,[^}]{0,200}url\s*:\s*` + bt + `([^` + bte + `\s]{4,})` + bt),
+		URLGroup:      2,
+		MethodGroup:   1,
+		DefaultMethod: "GET",
+	},
+	{
+		Name:          "XHR.open",
+		Regex:         regexp.MustCompile(`\.open\s*\(\s*['"]([A-Z]+)['"]\s*,\s*` + bt + `([^` + bte + `\s]{4,})` + bt),
+		URLGroup:      2,
+		MethodGroup:   1,
+		DefaultMethod: "GET",
+	},
+	{
+		Name:          "$.ajax",
+		Regex:         regexp.MustCompile(`\$\.ajax\s*\(\s*\{[^}]{0,300}url\s*:\s*` + bt + `([^` + bte + `\s]{4,})` + bt),
+		URLGroup:      1,
+		DefaultMethod: "GET",
+	},
+	{
+		Name:          "$.get/post",
+		Regex:         regexp.MustCompile(`\$\.(get|post|put|delete)\s*\(\s*` + bt + `([^` + bte + `\s]{4,})` + bt),
+		URLGroup:      2,
+		MethodGroup:   1,
+		DefaultMethod: "GET",
+	},
+	{
+		Name:          "superagent",
+		Regex:         regexp.MustCompile(`\brequest\s*\.\s*(get|post|put|delete|patch)\s*\(\s*` + bt + `([^` + bte + `\s]{4,})` + bt),
+		URLGroup:      2,
+		MethodGroup:   1,
+		DefaultMethod: "GET",
+	},
+	{
+		Name:          "router-definition",
+		Regex:         regexp.MustCompile(`(?:router|app)\s*\.\s*(get|post|put|delete|patch|all|use)\s*\(\s*` + bt + `([^` + bte + `\s]{2,})` + bt),
+		URLGroup:      2,
+		MethodGroup:   1,
+		DefaultMethod: "GET",
+	},
+	{
+		Name:          "url-var-assignment",
+		Regex:         regexp.MustCompile(`(?i)(?:^|[,\s{(])(?:url|endpoint|path|apiPath|apiUrl|baseUrl|actionUrl|href|action)\s*[=:]\s*` + bt + `(\/?(?:https?:\/\/|\/)[^` + bte + `\s<>{}|\\^]{4,})` + bt),
+		URLGroup:      1,
+		DefaultMethod: "GET",
+	},
+	{
+		Name:          "api-path-literal",
+		Regex:         regexp.MustCompile(`['"\x60](\/(?:api|v\d+|internal|admin|auth|rest|graphql|_api|service|backend|private|management|debug|config|webhook|callback|oauth|token|user|account|payment|order|search|upload|download|export|import|report|dashboard|panel|portal|rpc|ws|socket)[\/a-zA-Z0-9_\-\.{}:@!$&()*+,;=%?#]{2,})['"\x60]`),
+		URLGroup:      1,
+		DefaultMethod: "GET",
+	},
+	{
+		Name:          "absolute-url",
+		Regex:         regexp.MustCompile(`['"\x60](https?:\/\/[a-zA-Z0-9\-\.]+(?::[0-9]+)?\/[^\s'"\x60<>(){}|\\^]{4,})['"\x60]`),
+		URLGroup:      1,
+		DefaultMethod: "GET",
+	},
+}
+
+const bt = `['"\x60]`
+const bte = `'"\x60`
+
+// ─── Parameter Extraction ─────────────────────────────────────────────────────
+
+var (
+	reQueryParam   = regexp.MustCompile(`[?&]([a-zA-Z_][a-zA-Z0-9_\-]*)=`)
+	rePathParam    = regexp.MustCompile(`\{([a-zA-Z_][a-zA-Z0-9_]*)\}|/:([a-zA-Z_][a-zA-Z0-9_]*)`)
+	reTemplateVar  = regexp.MustCompile(`\$\{([a-zA-Z_][a-zA-Z0-9_\.]*)\}`)
+	reBodyParam    = regexp.MustCompile(`(?:body|data|payload|params)\s*[=:]\s*\{([^}]{1,300})\}`)
+	reBodyParamKey = regexp.MustCompile(`['"]?([a-zA-Z_][a-zA-Z0-9_]*)['"]?\s*:`)
+	// v2: hoisted (dulu di-compile tiap normaliseTemplateURL dipanggil)
+	reConcatTail = regexp.MustCompile(`\s*\+\s*\w+\s*$`)
+)
+
+func extractParams(rawURL string, contextLines []string) []string {
+	seen := make(map[string]bool)
+	var params []string
+
+	add := func(p string) {
+		p = strings.TrimSpace(p)
+		if p != "" && !seen[p] && len(p) < 40 {
+			seen[p] = true
+			params = append(params, p)
+		}
+	}
+
+	for _, m := range reQueryParam.FindAllStringSubmatch(rawURL, -1) {
+		add(m[1])
+	}
+	for _, m := range rePathParam.FindAllStringSubmatch(rawURL, -1) {
+		if m[1] != "" {
+			add(m[1])
+		} else {
+			add(m[2])
+		}
+	}
+	for _, m := range reTemplateVar.FindAllStringSubmatch(rawURL, -1) {
+		add(m[1])
+	}
+
+	ctx := strings.Join(contextLines, "\n")
+	for _, m := range reBodyParam.FindAllStringSubmatch(ctx, -1) {
+		for _, km := range reBodyParamKey.FindAllStringSubmatch(m[1], -1) {
+			k := km[1]
+			if k != "" && k != "true" && k != "false" && k != "null" {
+				add(k)
+			}
+		}
+	}
+	return params
+}
+
+// normaliseTemplateURL converts ${var} → {var} and removes trailing concat noise
+func normaliseTemplateURL(raw string) string {
+	s := reTemplateVar.ReplaceAllString(raw, `{$1}`)
+	s = reConcatTail.ReplaceAllString(s, `/{param}`)
+	return s
+}
+
+// ─── Interest Scoring ─────────────────────────────────────────────────────────
+
+var highKeywords = []string{
+	"admin", "internal", "debug", "dev", "test", "management",
+	"hidden", "secret", "private", "config", "backup", "shell",
+	"console", "superuser", "root", "system", "manage", "master",
+	"monitor", "panel", "portal", "ops", "staff", "backdoor",
+}
+
+var mediumKeywords = []string{
+	"api", "v1", "v2", "v3", "v4", "auth", "login", "logout",
+	"user", "account", "profile", "payment", "order", "session",
+	"token", "oauth", "upload", "export", "import", "webhook",
+	"graphql", "rest", "rpc", "ws", "socket", "report", "search",
+}
+
+func scoreInterest(u string) string {
+	lower := strings.ToLower(u)
+	for _, kw := range highKeywords {
+		if strings.Contains(lower, kw) {
+			return "HIGH"
+		}
+	}
+	for _, kw := range mediumKeywords {
+		if strings.Contains(lower, kw) {
+			return "MED"
+		}
+	}
+	return "LOW"
+}
+
+// ─── Static Asset Filter ──────────────────────────────────────────────────────
+
+var staticExtensions = map[string]bool{
+	".js": true, ".css": true, ".png": true, ".jpg": true, ".jpeg": true,
+	".gif": true, ".svg": true, ".ico": true, ".woff": true, ".woff2": true,
+	".ttf": true, ".eot": true, ".otf": true, ".map": true, ".mp4": true,
+	".webp": true, ".pdf": true, ".zip": true, ".gz": true,
+}
+
+var staticHosts = []string{
+	"cdn.", "fonts.googleapis.com", "fonts.gstatic.com", "jquery.com",
+	"bootstrapcdn.com", "cdnjs.cloudflare.com", "unpkg.com",
+	"jsdelivr.net", "ajax.googleapis.com", "static.", "assets.",
+}
+
+func isStaticAsset(rawURL string) bool {
+	path := rawURL
+	if idx := strings.Index(path, "?"); idx > 0 {
+		path = path[:idx]
+	}
+	for ext := range staticExtensions {
+		if strings.HasSuffix(strings.ToLower(path), ext) {
+			return true
+		}
+	}
+	lower := strings.ToLower(rawURL)
+	for _, h := range staticHosts {
+		if strings.Contains(lower, h) {
+			return true
+		}
+	}
+	return false
+}
+
+// ─── Base URL Auto-Detection ──────────────────────────────────────────────────
+
+var baseURLDeclarations = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)axios\s*\.defaults\s*\.baseURL\s*=\s*['"](\s*https?://[^'"]{5,120})\s*['"]`),
+	regexp.MustCompile(`(?i)base[_]?[Uu][Rr][Ll]\s*[=:]\s*['"](\s*https?://[^'"]{5,120})\s*['"]`),
+	regexp.MustCompile(`(?i)API[_]?BASE(?:[_]?URL)?\s*[=:]\s*['"](\s*https?://[^'"]{5,120})\s*['"]`),
+	regexp.MustCompile(`(?i)api[_]?(?:url|endpoint|host|root|server|origin)\s*[=:]\s*['"](\s*https?://[^'"]{5,120})\s*['"]`),
+	regexp.MustCompile(`(?i)root[_]?[Uu][Rr][Ll]\s*[=:]\s*['"](\s*https?://[^'"]{5,120})\s*['"]`),
+	regexp.MustCompile(`(?i)(?:server|backend|service)[_]?[Uu][Rr][Ll]\s*[=:]\s*['"](\s*https?://[^'"]{5,120})\s*['"]`),
+	regexp.MustCompile(`(?i)(?:VUE_APP|REACT_APP|NEXT_PUBLIC|VITE)[_]API[_]?(?:URL|BASE|ENDPOINT)\s*[=:]\s*['"](\s*https?://[^'"]{5,120})\s*['"]`),
+	regexp.MustCompile(`process\.env\.\w+\s*\|\|\s*['"](\s*https?://[^'"]{5,120})\s*['"]`),
+	regexp.MustCompile(`(?i)(?:^|[,\s{(])(?:host|origin|domain|endpoint)\s*[=:]\s*['"](\s*https?://[^'"]{5,120})\s*['"]`),
+}
+
+var noisyHosts = []string{
+	"cdn.", "fonts.googleapis", "fonts.gstatic", "cdnjs.", "unpkg.",
+	"jsdelivr.", "ajax.googleapis", "sentry.io", "segment.io",
+	"analytics", "tracking", "doubleclick", "google-analytics",
+	"stripe.com", "paypal.com", "facebook.com", "twitter.com",
+	"amazonaws.com", "cloudfront.net", "fastly.net", "akamai",
+}
+
+func isNoisyHost(host string) bool {
+	lower := strings.ToLower(host)
+	for _, n := range noisyHosts {
+		if strings.Contains(lower, n) {
+			return true
+		}
+	}
+	return false
+}
+
+var reAbsoluteURL = regexp.MustCompile(`https?://([a-zA-Z0-9\-\.]+(?::[0-9]+)?)(?:/[^\s'"` + "`" + `<>(){}|\\^]*)`)
+
+func detectBaseURL(content, jsURL string) string {
+	for _, pat := range baseURLDeclarations {
+		if m := pat.FindStringSubmatch(content); len(m) > 1 {
+			candidate := strings.TrimSpace(m[1])
+			candidate = strings.TrimRight(candidate, "/")
+			if candidate != "" && !isNoisyHost(extractHost(candidate)) {
+				return candidate
+			}
+		}
+	}
+
+	hostCount := make(map[string]int)
+	hostScheme := make(map[string]string)
+	for _, m := range reAbsoluteURL.FindAllStringSubmatch(content, -1) {
+		host := strings.ToLower(m[1])
+		if isNoisyHost(host) {
+			continue
+		}
+		fullURL := m[0]
+		lower := strings.ToLower(fullURL)
+		hasAPIPath := strings.Contains(lower, "/api") ||
+			strings.Contains(lower, "/v1") ||
+			strings.Contains(lower, "/v2") ||
+			strings.Contains(lower, "/v3") ||
+			strings.Contains(lower, "/auth") ||
+			strings.Contains(lower, "/graphql") ||
+			strings.Contains(lower, "/rest") ||
+			strings.Contains(lower, "/rpc")
+		if hasAPIPath {
+			hostCount[host] += 3
+		} else {
+			hostCount[host]++
+		}
+		if strings.HasPrefix(fullURL, "https://") {
+			hostScheme[host] = "https"
+		} else if _, ok := hostScheme[host]; !ok {
+			hostScheme[host] = "http"
+		}
+	}
+
+	var bestHost string
+	var bestScore int
+	for host, score := range hostCount {
+		if score > bestScore && score >= 2 {
+			bestScore = score
+			bestHost = host
+		}
+	}
+	if bestHost != "" {
+		scheme := hostScheme[bestHost]
+		if scheme == "" {
+			scheme = "https"
+		}
+		return scheme + "://" + bestHost
+	}
+
+	return originOf(jsURL)
+}
+
+func originOf(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	return u.Scheme + "://" + u.Host
+}
+
+// ─── URL Resolver ─────────────────────────────────────────────────────────────
+
+func resolveURL(raw, jsURL, baseOverride string) string {
+	raw = strings.TrimSpace(raw)
+	raw = normaliseTemplateURL(raw)
+
+	if strings.HasPrefix(raw, "http://") || strings.HasPrefix(raw, "https://") {
+		return raw
+	}
+	if strings.HasPrefix(raw, "//") {
+		return "https:" + raw
+	}
+
+	base := baseOverride
+	if base == "" {
+		base = jsURL
+	}
+	baseU, err := url.Parse(base)
+	if err != nil || baseU.Host == "" {
+		return raw
+	}
+	ref, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	resolved := baseU.ResolveReference(ref)
+	result := resolved.String()
+	result = strings.ReplaceAll(result, "%7B", "{")
+	result = strings.ReplaceAll(result, "%7D", "}")
+	return result
+}
+
+// ─── Known URL Normalisation ──────────────────────────────────────────────────
+
+func normaliseForFilter(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return strings.ToLower(strings.TrimRight(rawURL, "/"))
+	}
+	p := strings.ToLower(u.Path)
+	p = strings.TrimRight(p, "/")
+	if p == "" {
+		p = "/"
+	}
+	result := strings.ToLower(u.Host) + p
+	return result
+}
+
+// ─── lineIndex (v2) ────────────────────────────────────────────────────────────
+
+type lineIndex struct{ starts []int }
+
+func buildLineIndex(content string) *lineIndex {
+	starts := []int{0}
+	for i := 0; i < len(content); i++ {
+		if content[i] == '\n' {
+			starts = append(starts, i+1)
+		}
+	}
+	return &lineIndex{starts: starts}
+}
+
+func (li *lineIndex) lineAt(pos int) int {
+	lo, hi := 0, len(li.starts)-1
+	for lo < hi {
+		mid := (lo + hi + 1) / 2
+		if li.starts[mid] <= pos {
+			lo = mid
+		} else {
+			hi = mid - 1
+		}
+	}
+	return lo + 1
+}
+
+// ─── Core Extractor (v2: whole-content scan + char-window context) ─────────────
+
+const ctxWindow = 500 // char di kiri/kanan match untuk ekstraksi param
+
+func extractEndpoints(content, sourceURL, jsURL, baseOverride string, includeAssets, includeExternal bool) ([]Endpoint, string) {
+	var results []Endpoint
+	seen := make(map[string]bool)
+
+	effectiveBase := baseOverride
+	if effectiveBase == "" {
+		effectiveBase = detectBaseURL(content, jsURL)
+	}
+
+	li := buildLineIndex(content)
+	n := len(content)
+
+	for _, pat := range extractionPatterns {
+		for _, loc := range pat.Regex.FindAllStringSubmatchIndex(content, -1) {
+			if len(loc) < (pat.URLGroup+1)*2 {
+				continue
+			}
+			s, e := loc[pat.URLGroup*2], loc[pat.URLGroup*2+1]
+			if s < 0 || e < 0 {
+				continue
+			}
+			rawURL := strings.TrimSpace(content[s:e])
+			if len(rawURL) < 4 {
+				continue
+			}
+			if strings.Contains(rawURL, " ") {
+				continue
+			}
+			if strings.Contains(rawURL, "\\") || strings.HasPrefix(rawURL, "#") {
+				continue
+			}
+
+			rawURL = normaliseTemplateURL(rawURL)
+			absURL := resolveURL(rawURL, jsURL, effectiveBase)
+
+			if !includeAssets && isStaticAsset(absURL) {
+				continue
+			}
+			if !includeExternal {
+				baseHost := extractHost(effectiveBase)
+				absHost := extractHost(absURL)
+				if baseHost != "" && absHost != "" && absHost != baseHost {
+					if !sameSLD(baseHost, absHost) {
+						continue
+					}
+				}
+			}
+
+			dedupKey := strings.ToLower(absURL)
+			if seen[dedupKey] {
+				continue
+			}
+			seen[dedupKey] = true
+
+			method := strings.ToUpper(pat.DefaultMethod)
+			if pat.MethodGroup > 0 && len(loc) >= (pat.MethodGroup+1)*2 {
+				ms, me := loc[pat.MethodGroup*2], loc[pat.MethodGroup*2+1]
+				if ms >= 0 && me >= 0 {
+					method = strings.ToUpper(content[ms:me])
+				}
+			}
+
+			// v2: konteks = window karakter di sekitar match (bukan ±3 baris).
+			// Mencegah blowup pada JS minified (dulu konteks = seluruh file per match).
+			cs := s - ctxWindow
+			if cs < 0 {
+				cs = 0
+			}
+			ce := e + ctxWindow
+			if ce > n {
+				ce = n
+			}
+			params := extractParams(rawURL, []string{content[cs:ce]})
+
+			lineNum := li.lineAt(s)
+			results = append(results, Endpoint{
+				RawURL:   rawURL,
+				AbsURL:   absURL,
+				Method:   method,
+				Params:   params,
+				Source:   fmt.Sprintf("%s:%d", sourceURL, lineNum),
+				Line:     lineNum,
+				Interest: scoreInterest(absURL),
+			})
+		}
+	}
+	return results, effectiveBase
+}
+
+func extractHost(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(u.Host)
+}
+
+func sameSLD(a, b string) bool {
+	sld := func(h string) string {
+		if idx := strings.LastIndex(h, ":"); idx > 0 {
+			h = h[:idx]
+		}
+		parts := strings.Split(h, ".")
+		if len(parts) >= 2 {
+			return parts[len(parts)-2] + "." + parts[len(parts)-1]
+		}
+		return h
+	}
+	return sld(a) == sld(b)
+}

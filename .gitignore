@@ -1,0 +1,7 @@
+# Binary (source is multi-file)
+endpoint-hunter2
+
+# Go
+*.exe
+*.test
+*.out
