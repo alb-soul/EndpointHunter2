@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"net/url"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -47,6 +48,19 @@ var extractionPatterns = []ExtractionPattern{
 		Regex:         regexp.MustCompile(`fetch\s*\(\s*` + bt + `([^` + bte + `\s]+)` + bt + `\s*,\s*\{[^}]*method\s*:\s*['"]([A-Za-z]+)['"]`),
 		URLGroup:      1,
 		MethodGroup:   2,
+		DefaultMethod: "GET",
+	},
+	{
+		Name:          "ofetch/$fetch",
+		Regex:         regexp.MustCompile(`\b(?:ofetch|\$fetch)\s*\(\s*` + bt + `([^` + bte + `\s]{4,})` + bt),
+		URLGroup:      1,
+		DefaultMethod: "GET",
+	},
+	{
+		Name:          "ky",
+		Regex:         regexp.MustCompile(`\bky\s*\.\s*(get|post|put|delete|patch|head)\s*\(\s*` + bt + `([^` + bte + `\s]{4,})` + bt),
+		URLGroup:      2,
+		MethodGroup:   1,
 		DefaultMethod: "GET",
 	},
 	{
@@ -124,7 +138,7 @@ var extractionPatterns = []ExtractionPattern{
 	},
 	{
 		Name:          "absolute-url",
-		Regex:         regexp.MustCompile(`['"\x60](https?:\/\/[a-zA-Z0-9\-\.]+(?::[0-9]+)?\/[^\s'"\x60<>(){}|\\^]{4,})['"\x60]`),
+		Regex:         regexp.MustCompile(`['"\x60]((?:https?|wss?)://[a-zA-Z0-9\-\.]+(?::[0-9]+)?\/[^\s'"\x60<>(){}|\\^]{4,})['"\x60]`),
 		URLGroup:      1,
 		DefaultMethod: "GET",
 	},
@@ -300,27 +314,33 @@ func detectBaseURL(content, jsURL string) string {
 		}
 	}
 
-	hostCount := make(map[string]int)
+	// Absolute URLs must NOT hijack the base on weak signal: require >=3
+	// DISTINCT absolute URLs to a host and score >= 5 (distinct +2 bonus
+	// if any has API path). 1-2 stray absolute links (docs, examples)
+	// keep page-origin resolution. Hosts iterated sorted for determinism.
+	seenURLs := make(map[string]map[string]bool)
 	hostScheme := make(map[string]string)
+	hostHasAPI := make(map[string]bool)
 	for _, m := range reAbsoluteURL.FindAllStringSubmatch(content, -1) {
 		host := strings.ToLower(m[1])
 		if isNoisyHost(host) {
 			continue
 		}
 		fullURL := m[0]
+		if seenURLs[host] == nil {
+			seenURLs[host] = make(map[string]bool)
+		}
+		seenURLs[host][fullURL] = true
 		lower := strings.ToLower(fullURL)
-		hasAPIPath := strings.Contains(lower, "/api") ||
+		if strings.Contains(lower, "/api") ||
 			strings.Contains(lower, "/v1") ||
 			strings.Contains(lower, "/v2") ||
 			strings.Contains(lower, "/v3") ||
 			strings.Contains(lower, "/auth") ||
 			strings.Contains(lower, "/graphql") ||
 			strings.Contains(lower, "/rest") ||
-			strings.Contains(lower, "/rpc")
-		if hasAPIPath {
-			hostCount[host] += 3
-		} else {
-			hostCount[host]++
+			strings.Contains(lower, "/rpc") {
+			hostHasAPI[host] = true
 		}
 		if strings.HasPrefix(fullURL, "https://") {
 			hostScheme[host] = "https"
@@ -329,10 +349,19 @@ func detectBaseURL(content, jsURL string) string {
 		}
 	}
 
+	var hosts []string
+	for host := range seenURLs {
+		hosts = append(hosts, host)
+	}
+	sort.Strings(hosts)
 	var bestHost string
 	var bestScore int
-	for host, score := range hostCount {
-		if score > bestScore && score >= 2 {
+	for _, host := range hosts {
+		score := len(seenURLs[host])
+		if hostHasAPI[host] {
+			score += 2
+		}
+		if score > bestScore && len(seenURLs[host]) >= 3 && score >= 5 {
 			bestScore = score
 			bestHost = host
 		}
@@ -366,7 +395,15 @@ func resolveURL(raw, jsURL, baseOverride string) string {
 		return raw
 	}
 	if strings.HasPrefix(raw, "//") {
-		return "https:" + raw
+		scheme := "https"
+		base := baseOverride
+		if base == "" {
+			base = jsURL
+		}
+		if bu, err := url.Parse(base); err == nil && bu.Scheme != "" {
+			scheme = bu.Scheme
+		}
+		return scheme + ":" + raw
 	}
 
 	base := baseOverride
@@ -395,12 +432,15 @@ func normaliseForFilter(rawURL string) string {
 	if err != nil {
 		return strings.ToLower(strings.TrimRight(rawURL, "/"))
 	}
-	p := strings.ToLower(u.Path)
+	p := u.EscapedPath()
+	if p == "" {
+		p = "/"
+	}
 	p = strings.TrimRight(p, "/")
 	if p == "" {
 		p = "/"
 	}
-	result := strings.ToLower(u.Host) + p
+	result := strings.ToLower(u.Hostname()) + p
 	return result
 }
 
@@ -429,6 +469,15 @@ func (li *lineIndex) lineAt(pos int) int {
 		}
 	}
 	return lo + 1
+}
+
+// validHTTPMethod: only real verbs pass; router "USE"/"ALL" etc fall back to DefaultMethod.
+func validHTTPMethod(m string) bool {
+	switch m {
+	case "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS":
+		return true
+	}
+	return false
 }
 
 // ─── Core Extractor (v2: whole-content scan + char-window context) ─────────────
@@ -476,18 +525,16 @@ func extractEndpoints(content, sourceURL, jsURL, baseOverride string, includeAss
 			if !includeExternal {
 				baseHost := extractHost(effectiveBase)
 				absHost := extractHost(absURL)
-				if baseHost != "" && absHost != "" && absHost != baseHost {
-					if !sameSLD(baseHost, absHost) {
-						continue
-					}
+				if !sameSite(baseHost, absHost) {
+					continue
 				}
 			}
 
-			dedupKey := strings.ToLower(absURL)
-			if seen[dedupKey] {
+			dk := dedupKey(absURL)
+			if seen[dk] {
 				continue
 			}
-			seen[dedupKey] = true
+			seen[dk] = true
 
 			method := strings.ToUpper(pat.DefaultMethod)
 			if pat.MethodGroup > 0 && len(loc) >= (pat.MethodGroup+1)*2 {
@@ -495,6 +542,9 @@ func extractEndpoints(content, sourceURL, jsURL, baseOverride string, includeAss
 				if ms >= 0 && me >= 0 {
 					method = strings.ToUpper(content[ms:me])
 				}
+			}
+			if !validHTTPMethod(method) {
+				method = strings.ToUpper(pat.DefaultMethod)
 			}
 
 			// v2: konteks = window karakter di sekitar match (bukan ±3 baris).
@@ -529,19 +579,34 @@ func extractHost(rawURL string) string {
 	if err != nil {
 		return ""
 	}
-	return strings.ToLower(u.Host)
+	return strings.ToLower(u.Hostname())
 }
 
-func sameSLD(a, b string) bool {
-	sld := func(h string) string {
-		if idx := strings.LastIndex(h, ":"); idx > 0 {
-			h = h[:idx]
-		}
-		parts := strings.Split(h, ".")
-		if len(parts) >= 2 {
-			return parts[len(parts)-2] + "." + parts[len(parts)-1]
-		}
-		return h
+// dedupKey: canonical key that preserves case-sensitive path/query
+// (only scheme+host are lowercased). /API/Users != /api/users.
+func dedupKey(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		return strings.ToLower(rawURL)
 	}
-	return sld(a) == sld(b)
+	u.Scheme = strings.ToLower(u.Scheme)
+	u.Host = strings.ToLower(u.Host)
+	return u.String()
+}
+
+// sameSite: exact host match or subdomain-of-base (no naive SLD —
+// evil.co.uk must NOT equal example.co.uk).
+func sameSite(baseHost, absHost string) bool {
+	if baseHost == "" || absHost == "" {
+		return true
+	}
+	if absHost == baseHost {
+		return true
+	}
+	return strings.HasSuffix(absHost, "."+baseHost)
+}
+
+// sameSLD kept for compat (unused by filter logic).
+func sameSLD(a, b string) bool {
+	return sameSite(a, b)
 }

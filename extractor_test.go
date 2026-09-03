@@ -1,0 +1,239 @@
+package main
+
+import (
+	"strings"
+	"testing"
+)
+
+func epsByURL(eps []Endpoint) map[string]Endpoint {
+	m := map[string]Endpoint{}
+	for _, e := range eps {
+		m[e.AbsURL] = e
+	}
+	return m
+}
+
+func TestExtractFamilies(t *testing.T) {
+	js := "const a = 1;\n" +
+		"fetch(\"/api/users\", {method: \"POST\", body: JSON.stringify({name: \"x\"})});\n" +
+		"fetch('https://files.example.com/dl/items?page=2');\n" +
+		"axios.get(\"/api/profile\");\n" +
+		"axios.post(\"https://files.example.com/v9/orders\", {id: 1});\n" +
+		"axios({url: \"/api/search\", method: \"GET\"});\n" +
+		"axios({method: \"DELETE\", url: \"/api/item/5\"});\n" +
+		"var xhr = new XMLHttpRequest(); xhr.open(\"PUT\", \"/api/upload\");\n" +
+		"$.ajax({url: \"/api/legacy\", type: \"GET\"});\n" +
+		"$.get(\"/api/ping\");\n" +
+		"request.post(\"https://files.example.com/v9/submit\");\n" +
+		"router.get(\"/admin/users/:id\", handler);\n" +
+		"app.use(\"/api/mw\");\n" +
+		"const endpoint = \"/api/v2/orders\";\n" +
+		"const tpl = `/api/users/${userId}/orders`;\n" +
+		"'https://svc.example.com/lib.js'\n"
+	eps, _ := extractEndpoints(js, "https://example.com/app.js", "https://example.com/app.js", "", false, true)
+	m := epsByURL(eps)
+	want := map[string]string{
+		"https://example.com/api/users":                 "POST",
+		"https://files.example.com/dl/items?page=2":     "GET",
+		"https://example.com/api/profile":               "GET",
+		"https://files.example.com/v9/orders":           "POST",
+		"https://example.com/api/search":                "GET",
+		"https://example.com/api/item/5":                "DELETE",
+		"https://example.com/api/upload":                "PUT",
+		"https://example.com/api/legacy":                "GET",
+		"https://example.com/api/ping":                  "GET",
+		"https://files.example.com/v9/submit":           "POST",
+		"https://example.com/admin/users/:id":           "GET",
+		"https://example.com/api/mw":                    "GET",
+		"https://example.com/api/v2/orders":             "GET",
+		"https://example.com/api/users/{userId}/orders": "GET",
+	}
+	for u, method := range want {
+		e, ok := m[u]
+		if !ok {
+			t.Errorf("missing endpoint %s", u)
+			continue
+		}
+		if e.Method != method {
+			t.Errorf("%s: method=%s want %s", u, e.Method, method)
+		}
+	}
+	// static asset filtered by default
+	for u := range m {
+		if strings.Contains(u, "cdn.example.com/lib.js") {
+			t.Errorf("static asset not filtered: %s", u)
+		}
+	}
+}
+
+func TestBaseResolution(t *testing.T) {
+	// pure relative + 1 absolute API URL -> page origin wins (no hijack)
+	js := "fetch(\"/api/a\");\nfetch(\"https://api.example.com/v1/only\");\n"
+	eps, base := extractEndpoints(js, "https://example.com/a.js", "https://example.com/a.js", "", false, true)
+	if base != "https://example.com" {
+		t.Fatalf("single absolute URL hijacked base: %s", base)
+	}
+	found := false
+	for _, e := range eps {
+		if e.AbsURL == "https://example.com/api/a" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("relative endpoint lost")
+	}
+	// 3 distinct absolute API URLs -> override intended
+	js2 := "fetch(\"https://api.example.com/v1/a\");\n" +
+		"fetch(\"https://api.example.com/v1/b\");\n" +
+		"fetch(\"https://api.example.com/v1/c\");\n" +
+		"fetch(\"/v1/me\");\n"
+	eps2, base2 := extractEndpoints(js2, "https://example.com/a.js", "https://example.com/a.js", "", false, true)
+	if base2 != "https://api.example.com" {
+		t.Fatalf("strong signal should override base, got %s", base2)
+	}
+	hit := false
+	for _, e := range eps2 {
+		if e.AbsURL == "https://api.example.com/v1/me" {
+			hit = true
+		}
+	}
+	if !hit {
+		t.Fatalf("relative endpoint not resolved against overridden base")
+	}
+}
+
+func TestModernFetchWrappers(t *testing.T) {
+	js := "const r1 = await ofetch(\"/api/ofetch-data\");\n" +
+		"const r2 = await $fetch(`https://api.example.com/v1/dollar`, {method: 'POST'});\n" +
+		"const r3 = await ky.post(\"/api/kything\");\n" +
+		"const r4 = await ky.get(\"https://api.example.com/v1/kyget\");\n"
+	eps, _ := extractEndpoints(js, "https://example.com/a.js", "https://example.com/a.js", "", false, true)
+	m := epsByURL(eps)
+	for _, u := range []string{
+		"https://example.com/api/ofetch-data",
+		"https://api.example.com/v1/dollar",
+		"https://api.example.com/v1/kyget",
+	} {
+		if _, ok := m[u]; !ok {
+			t.Errorf("missing modern wrapper endpoint %s", u)
+		}
+	}
+}
+
+func TestWebSocketScheme(t *testing.T) {
+	js := "const ws = new WebSocket(\"wss://example.com/socket.io/?EIO=4\");\n"
+	eps, _ := extractEndpoints(js, "https://example.com/a.js", "https://example.com/a.js", "", false, true)
+	found := false
+	for _, e := range eps {
+		if strings.HasPrefix(e.AbsURL, "wss://example.com/socket.io") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("wss:// endpoint missed")
+	}
+}
+
+func TestCaseSensitiveDedup(t *testing.T) {
+	js := "fetch(\"/API/Users\");\nfetch(\"/api/users\");\n"
+	eps, _ := extractEndpoints(js, "https://example.com/a.js", "https://example.com/a.js", "", false, true)
+	if len(eps) != 2 {
+		t.Errorf("case-differing paths merged: got %d want 2", len(eps))
+	}
+}
+
+func TestExternalSLD(t *testing.T) {
+	js := "fetch(\"https://evil.co.uk/api/steal\");\nfetch(\"https://api.example.co.uk/api/ok\");\n"
+	eps, _ := extractEndpoints(js, "https://example.co.uk/app.js", "https://example.co.uk/app.js", "", false, false)
+	m := epsByURL(eps)
+	if _, ok := m["https://evil.co.uk/api/steal"]; ok {
+		t.Errorf("evil.co.uk kept as same-site (naive SLD)")
+	}
+	if _, ok := m["https://api.example.co.uk/api/ok"]; !ok {
+		t.Errorf("subdomain dropped, should be kept")
+	}
+}
+
+func TestProtoRelativeScheme(t *testing.T) {
+	js := "var endpoint = \"//svc.example.com/lib/api/data\";\n"
+	eps, _ := extractEndpoints(js, "http://example.com/a.js", "http://example.com/a.js", "", false, true)
+	found := false
+	for _, e := range eps {
+		if strings.HasPrefix(e.AbsURL, "http://svc.example.com/") {
+			found = true
+		}
+		if strings.HasPrefix(e.AbsURL, "https://svc.example.com/") {
+			t.Errorf("http base got https: URL: %s", e.AbsURL)
+		}
+	}
+	if !found {
+		t.Errorf("protocol-relative URL not resolved")
+	}
+}
+
+func TestMethodWhitelist(t *testing.T) {
+	js := "router.use(\"/api/mw2\");\n"
+	eps, _ := extractEndpoints(js, "https://example.com/a.js", "https://example.com/a.js", "", false, true)
+	for _, e := range eps {
+		if e.Method != "GET" && e.Method != "POST" && e.Method != "PUT" && e.Method != "PATCH" && e.Method != "DELETE" && e.Method != "HEAD" && e.Method != "OPTIONS" {
+			t.Errorf("non-HTTP method leaked: %s", e.Method)
+		}
+	}
+}
+
+func TestKnownFilterPort(t *testing.T) {
+	ks := newKnownSet()
+	ks.Add("https://example.com:443/api/known")
+	if !ks.Contains("https://example.com/api/known") {
+		t.Errorf("same endpoint with/without default port not matched by known filter")
+	}
+}
+
+func TestEnrichBody(t *testing.T) {
+	ep := Endpoint{AbsURL: "https://example.com/api/users/{id}?verbose=", Method: "POST", Params: []string{"name", "verbose", "id"}}
+	e := enrichEndpoint(ep)
+	if !strings.Contains(e.URL, "/users/FUZZ") {
+		t.Errorf("path placeholder not fuzzed: %s", e.URL)
+	}
+	if len(e.Body) == 0 || e.Body[0] != "name" {
+		t.Errorf("body params wrong: %v", e.Body)
+	}
+	for _, p := range e.Body {
+		if p == "id" || p == "verbose" {
+			t.Errorf("already-covered param leaked to body: %s", p)
+		}
+	}
+	c := buildCurl(ep, "json")
+	if len(c) != 1 || !strings.Contains(c[0], "-X POST") || !strings.Contains(c[0], "application/json") {
+		t.Errorf("bad curl: %v", c)
+	}
+}
+
+func TestScoreInterest(t *testing.T) {
+	if scoreInterest("https://x.com/api/admin/users") != "HIGH" {
+		t.Errorf("admin should be HIGH")
+	}
+	if scoreInterest("https://x.com/api/v1/items") != "MED" {
+		t.Errorf("api/v1 should be MED")
+	}
+	if scoreInterest("https://x.com/static/app.js") != "LOW" {
+		t.Errorf("static should be LOW")
+	}
+}
+
+func TestMatchesScopeAndSelfFilter(t *testing.T) {
+	if !matchesScope("https://sub.example.com/a", "example.com") {
+		t.Errorf("subdomain scope failed")
+	}
+	if matchesScope("https://example.com.evil.com/a", "example.com") {
+		t.Errorf("suffix trick passed scope")
+	}
+	eps, _ := extractEndpoints(
+		"fetch(\"https://example.com/app.js\");\nfetch(\"/api/x\");\n",
+		"https://example.com/app.js", "https://example.com/app.js", "", false, true)
+	for _, e := range eps {
+		if e.AbsURL == "https://example.com/app.js" {
+			t.Errorf("self URL not filtered")
+		}
+	}
+}

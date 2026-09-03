@@ -36,7 +36,7 @@ import (
 )
 
 const (
-	version   = "2.0.0"
+	version   = "2.0.1"
 	defaultUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 	maxBodyMB = 10
 	banner    = `
@@ -397,12 +397,12 @@ func (ks *KnownSet) Add(rawURL string) {
 	if rawURL == "" {
 		return
 	}
-	ks.full[strings.ToLower(rawURL)] = true
+	ks.full[dedupKey(rawURL)] = true
 	ks.paths[normaliseForFilter(rawURL)] = true
 }
 
 func (ks *KnownSet) Contains(rawURL string) bool {
-	if ks.full[strings.ToLower(rawURL)] {
+	if ks.full[dedupKey(rawURL)] {
 		return true
 	}
 	return ks.paths[normaliseForFilter(rawURL)]
@@ -455,6 +455,12 @@ func logVerbose(cfg *Config, format string, args ...interface{}) {
 func logInfo(cfg *Config, format string, args ...interface{}) {
 	if !cfg.Silent {
 		fmt.Fprintf(os.Stderr, format+"\n", args...)
+	}
+}
+
+func logWarn(cfg *Config, format string, args ...interface{}) {
+	if !cfg.Silent {
+		fmt.Fprintf(os.Stderr, cYellow+"[!]"+cReset+" "+format+"\n", args...)
 	}
 }
 
@@ -581,6 +587,9 @@ func main() {
 	if cfg.BodyFormat != "form" && cfg.BodyFormat != "both" {
 		cfg.BodyFormat = "json"
 	}
+	if cfg.Threads < 1 {
+		cfg.Threads = 1 // -t 0 would deadlock (no workers, blocked feeder)
+	}
 
 	httpClient = buildClient(cfg)
 
@@ -625,9 +634,19 @@ func main() {
 			scanItems = append(scanItems, WorkItem{URL: u})
 		}
 		if cfg.LocalJS != "" {
-			data, err := os.ReadFile(cfg.LocalJS)
+			f, err := os.Open(cfg.LocalJS)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error reading JS file: %v\n", err)
+				os.Exit(1)
+			}
+			data, err := io.ReadAll(io.LimitReader(f, cfg.MaxBodyBytes))
+			f.Close()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error reading JS file: %v\n", err)
+				os.Exit(1)
+			}
+			if bytes.IndexByte(data, 0) != -1 {
+				fmt.Fprintf(os.Stderr, "Error: %s looks binary, refusing to scan\n", cfg.LocalJS)
 				os.Exit(1)
 			}
 			scanItems = append(scanItems, WorkItem{URL: cfg.LocalJS, IsLocal: true, Content: string(data)})
@@ -638,10 +657,16 @@ func main() {
 			os.Exit(1)
 		}
 		// default: input URLs auto-known
+		hasLocal := false
 		for _, item := range scanItems {
 			if !item.IsLocal {
 				known.Add(item.URL)
+			} else {
+				hasLocal = true
 			}
+		}
+		if hasLocal && cfg.BaseURL == "" {
+			logWarn(cfg, "local JS without -b/--base: relative paths stay relative; --scope and absolute known-entries won't apply to them")
 		}
 	}
 
@@ -723,7 +748,7 @@ func main() {
 				found := processURL(cfg, item, known, cfg.BaseURL)
 				mu.Lock()
 				for _, ep := range found {
-					key := strings.ToLower(ep.AbsURL)
+					key := dedupKey(ep.AbsURL)
 					if !globalSeen[key] {
 						globalSeen[key] = true
 						allFound = append(allFound, ep)
