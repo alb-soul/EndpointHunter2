@@ -237,3 +237,29 @@ func TestMatchesScopeAndSelfFilter(t *testing.T) {
 		}
 	}
 }
+
+func TestBinusBaseHijack(t *testing.T) {
+	// MoreServiceUrl menunjuk halaman frontend (.php) — tidak boleh jadi base.
+	// URL API absolut di sibling subdomain harus tetap keluar walau
+	// includeExternal=false (base jatuh ke majority-vote api.apps...).
+	js := `var MoreServiceUrl="https://acadservices.apps.binus.ac.id/LoginAD.php",` +
+		`apiLetterReqToken="https://api.apps.binus.ac.id/letter_request/auth/token",` +
+		`apiNotifReportToken="https://api.apps.binus.ac.id/e2es/auth/token",` +
+		`apiDSAToken="https://api.apps.binus.ac.id/digital_school/auth/token",` +
+		`apiExamToken="https://api.apps.binus.ac.id/exam/status";`
+	eps, base := extractEndpoints(js,
+		"https://newacadservices.apps.binus.ac.id/assets/app.js",
+		"https://newacadservices.apps.binus.ac.id/assets/app.js", "", false, false)
+	if strings.Contains(base, "LoginAD") {
+		t.Fatalf("base hijacked by frontend page URL: %s", base)
+	}
+	m := epsByURL(eps)
+	for _, u := range []string{
+		"https://api.apps.binus.ac.id/letter_request/auth/token",
+		"https://api.apps.binus.ac.id/e2es/auth/token",
+	} {
+		if _, ok := m[u]; !ok {
+			t.Errorf("missing endpoint %s (base=%s)", u, base)
+		}
+	}
+}

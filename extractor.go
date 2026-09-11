@@ -303,14 +303,55 @@ func isNoisyHost(host string) bool {
 
 var reAbsoluteURL = regexp.MustCompile(`https?://([a-zA-Z0-9\-\.]+(?::[0-9]+)?)(?:/[^\s'"` + "`" + `<>(){}|\\^]*)`)
 
+// pageLikeExtensions: URL halaman frontend / aset — tidak pernah valid
+// sebagai API base.
+// BUGFIX binus-2026-09: deklarasi MoreServiceUrl="https://host/LoginAD.php"
+// sempat jadi effectiveBase (lengkap dgn path); filter external lalu membuang
+// URL API absolut di sibling subdomain (api.apps.binus.ac.id). Kandidat
+// begini di-skip agar deteksi jatuh ke majority-vote / origin.
+var pageLikeExtensions = []string{
+	".php", ".aspx", ".ashx", ".asmx", ".jsp", ".jspx", ".do", ".action",
+	".html", ".htm", ".xhtml", ".js", ".jsx", ".ts", ".css", ".less", ".scss",
+	".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".woff", ".woff2",
+}
+
+func isPageLikeURL(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Path == "" || u.Path == "/" {
+		return false
+	}
+	last := u.Path
+	if i := strings.LastIndex(last, "/"); i >= 0 {
+		last = last[i+1:]
+	}
+	if i := strings.IndexAny(last, "?#"); i >= 0 {
+		last = last[:i]
+	}
+	dot := strings.LastIndex(last, ".")
+	if dot <= 0 || dot == len(last)-1 {
+		return false
+	}
+	ext := strings.ToLower(last[dot:])
+	for _, e := range pageLikeExtensions {
+		if ext == e {
+			return true
+		}
+	}
+	return false
+}
+
 func detectBaseURL(content, jsURL string) string {
 	for _, pat := range baseURLDeclarations {
 		if m := pat.FindStringSubmatch(content); len(m) > 1 {
 			candidate := strings.TrimSpace(m[1])
 			candidate = strings.TrimRight(candidate, "/")
-			if candidate != "" && !isNoisyHost(extractHost(candidate)) {
-				return candidate
+			if candidate == "" || isNoisyHost(extractHost(candidate)) {
+				continue
 			}
+			if isPageLikeURL(candidate) {
+				continue // URL halaman frontend — bukan API base
+			}
+			return candidate
 		}
 	}
 
