@@ -13,6 +13,7 @@
 - **Auto base-URL detection** — picks up `axios.defaults.baseURL`, `baseUrl`, `VUE_APP_*`, `process.env.* || "..."` etc., so relative paths resolve accurately.
 - **Interest scoring** — each endpoint is ranked `HIGH` / `MED` / `LOW` by path keywords.
 - **Scope & noise control** — default luas (semua URL absolut terlist, termasuk sibling subdomain); `--scope` / `--scope-exact` / `-bs` untuk menyempit, static-asset filtering, dan known-endpoints filter (`-k`).
+- **Method attribution via variable resolution** — `fetch(VAR,{method:"POST"})` / `axios.post(VAR)` / `$.ajax` / `xhr.open` dihubungkan ke deklarasi `VAR="https://..."` sehingga label method tepat (bukan default GET).
 - **Param extraction** — query params, path params (`{id}`, `/:id`), template vars, and body params (kinda guessable from `body:`/`data:`/`params:` objects) are captured.
 - **Multi-format output** — colored table, plain URLs, JSON, ready-to-run `curl` commands with FUZZ-injected params and body, plus a one-command **multi-stream** `--out-prefix` (`<p>.txt` / `<p>.jsonl` / `<p>.curl.sh`).
 - **Fuzz mode** — `{param}` placeholders are rewritten to `FUZZ` for direct use with ffuf/nuclei.

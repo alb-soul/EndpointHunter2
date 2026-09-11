@@ -525,6 +525,93 @@ func validHTTPMethod(m string) bool {
 
 const ctxWindow = 500 // char di kiri/kanan match untuk ekstraksi param
 
+// reVarAssign: `NAME="https://..."` / `NAME:'...'` / `NAME:...` — deklarasi
+// URL absolut ke variabel/properti. Value wajib absolut (presisi tinggi).
+// BUGFIX binus-2026-09: endpoint hasil deklarasi bare-string selalu
+// berlabel DefaultMethod (GET) walau call-site memakai POST.
+var reVarAssign = regexp.MustCompile(`[\s,{(;]([A-Za-z_$][A-Za-z0-9_$]{0,63})\s*[=:]\s*["'](https?://[^'"` + "`" + `\s<>(){}|\\^]+)["']`)
+
+// collectVarURLs: namaVar(lower) -> URL absolut (first wins).
+func collectVarURLs(content string) map[string]string {
+	out := map[string]string{}
+	for _, m := range reVarAssign.FindAllStringSubmatch(content, -1) {
+		if len(m) < 3 {
+			continue
+		}
+		k := strings.ToLower(m[1])
+		if _, ok := out[k]; !ok {
+			out[k] = m[2]
+		}
+	}
+	return out
+}
+
+// resolveVarCallMethods: hubungkan call-site fetch(VAR,...)/axios -> method
+// eksplisit. absURL(lower) -> METHOD. Prefer non-GET saat konflik.
+func resolveVarCallMethods(content string, varURLs map[string]string) map[string]string {
+	out := map[string]string{}
+	if len(varURLs) == 0 {
+		return out
+	}
+	put := func(varName, method string) {
+		u, ok := varURLs[strings.ToLower(varName)]
+		if !ok || u == "" {
+			return
+		}
+		method = strings.ToUpper(method)
+		if !validHTTPMethod(method) {
+			return
+		}
+		k := strings.ToLower(u)
+		if cur, dup := out[k]; !dup || (cur == "GET" && method != "GET") {
+			out[k] = method
+		}
+	}
+	// fetch(VAR, {method:"POST",...}) — options chunk dibatasi, method
+	// biasanya mendahului nested headers:{...}
+	for _, m := range regexp.MustCompile(`fetch\s*\(\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*,\s*\{[^}]{0,400}method\s*:\s*['"]([A-Za-z]+)['"]`).FindAllStringSubmatch(content, -1) {
+		if len(m) >= 3 {
+			put(m[1], m[2])
+		}
+	}
+	// axios.get|post|...(VAR)
+	for _, m := range regexp.MustCompile(`axios\s*\.\s*(get|post|put|delete|patch|head|options)\s*\(\s*([A-Za-z_$][A-Za-z0-9_$]*)`).FindAllStringSubmatch(content, -1) {
+		if len(m) >= 3 {
+			put(m[2], m[1])
+		}
+	}
+	// axios({url:VAR, method:"POST"}) & urutan terbalik
+	for _, m := range regexp.MustCompile(`axios\s*\(\s*\{[^}]{0,300}url\s*:\s*([A-Za-z_$][A-Za-z0-9_$]*)[^}]{0,300}method\s*:\s*['"]([A-Za-z]+)['"]`).FindAllStringSubmatch(content, -1) {
+		if len(m) >= 3 {
+			put(m[1], m[2])
+		}
+	}
+	for _, m := range regexp.MustCompile(`axios\s*\(\s*\{[^}]{0,300}method\s*:\s*['"]([A-Za-z]+)['"]\s*,[^}]{0,300}url\s*:\s*([A-Za-z_$][A-Za-z0-9_$]*)`).FindAllStringSubmatch(content, -1) {
+		if len(m) >= 3 {
+			put(m[2], m[1])
+		}
+	}
+	// $.ajax({url:VAR, method/type:"POST"})
+	for _, m := range regexp.MustCompile(`\$\.ajax\s*\(\s*\{[^}]{0,300}url\s*:\s*([A-Za-z_$][A-Za-z0-9_$]*)[^}]{0,300}(?:method|type)\s*:\s*['"]([A-Za-z]+)['"]`).FindAllStringSubmatch(content, -1) {
+		if len(m) >= 3 {
+			put(m[1], m[2])
+		}
+	}
+	// $.get|post(VAR)
+	for _, m := range regexp.MustCompile(`\$\.(get|post)\s*\(\s*([A-Za-z_$][A-Za-z0-9_$]*)`).FindAllStringSubmatch(content, -1) {
+		if len(m) >= 3 {
+			put(m[2], m[1])
+		}
+	}
+	// xhr.open("POST", VAR)
+	for _, m := range regexp.MustCompile(`\.open\s*\(\s*['"]([A-Za-z]+)['"]\s*,\s*([A-Za-z_$][A-Za-z0-9_$]*)`).FindAllStringSubmatch(content, -1) {
+		if len(m) >= 3 {
+			put(m[2], m[1])
+		}
+	}
+	return out
+}
+
 func extractEndpoints(content, sourceURL, jsURL, baseOverride string, includeAssets, includeExternal bool) ([]Endpoint, string, int) {
 	var results []Endpoint
 	seen := make(map[string]bool)
@@ -534,6 +621,9 @@ func extractEndpoints(content, sourceURL, jsURL, baseOverride string, includeAss
 	if effectiveBase == "" {
 		effectiveBase = detectBaseURL(content, jsURL)
 	}
+
+	// Atribusi method dari call-site variabel (override label default).
+	varMethods := resolveVarCallMethods(content, collectVarURLs(content))
 
 	li := buildLineIndex(content)
 	n := len(content)
@@ -588,6 +678,13 @@ func extractEndpoints(content, sourceURL, jsURL, baseOverride string, includeAss
 			}
 			if !validHTTPMethod(method) {
 				method = strings.ToUpper(pat.DefaultMethod)
+			}
+			// Override hanya bila situs literal tak memberi info eksplisit
+			// (method == DefaultMethod): call-site variabel lebih tahu.
+			if method == strings.ToUpper(pat.DefaultMethod) {
+				if vm, ok := varMethods[strings.ToLower(absURL)]; ok && validHTTPMethod(vm) {
+					method = vm
+				}
 			}
 
 			// v2: konteks = window karakter di sekitar match (bukan ±3 baris).

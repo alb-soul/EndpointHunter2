@@ -393,3 +393,39 @@ func TestPassScopeFilterModes(t *testing.T) {
 		t.Fatalf("-bs exact must keep source host itself")
 	}
 }
+
+func TestVarMethodAttribution(t *testing.T) {
+	js := `const T="https://api.x/auth/token";` +
+		`const U="https://api.x/items";` +
+		`const V="https://api.x/legacy";` +
+		`fetch(T,{method:"POST",body:"{}"});` +
+		`axios.get(U);` +
+		`fetch(V);` +
+		`fetch("https://api.x/plain");`
+	eps, _, _ := extractEndpoints(js, "https://app.x/a.js", "https://app.x/a.js", "", false, true)
+	m := epsByURL(eps)
+	if e, ok := m["https://api.x/auth/token"]; !ok || e.Method != "POST" {
+		t.Errorf("var-POST not attributed: %+v", e)
+	}
+	if e, ok := m["https://api.x/items"]; !ok || e.Method != "GET" {
+		t.Errorf("axios.get var wrong: %+v", e)
+	}
+	if e, ok := m["https://api.x/plain"]; !ok || e.Method != "GET" {
+		t.Errorf("bare literal default wrong: %+v", e)
+	}
+}
+
+func TestVarMethodBinusShape(t *testing.T) {
+	// bentuk asli Binus: nested headers:{...} setelah method
+	js := `apiLetterReqToken="https://api.apps.binus.ac.id/letter_request/auth/token",` +
+		`fetchApiToken=async()=>await(await fetch(apiLetterReqToken,{method:"GET",headers:{Authorization:getApiAuthToken}})).json()`
+	eps, _, _ := extractEndpoints(js, "https://n.apps.binus.ac.id/a.js", "https://n.apps.binus.ac.id/a.js", "", false, true)
+	m := epsByURL(eps)
+	e, ok := m["https://api.apps.binus.ac.id/letter_request/auth/token"]
+	if !ok {
+		t.Fatalf("token endpoint missing")
+	}
+	if e.Method != "GET" {
+		t.Errorf("method = %s want GET (call-site)", e.Method)
+	}
+}
