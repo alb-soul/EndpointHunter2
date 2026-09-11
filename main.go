@@ -509,8 +509,11 @@ func processURL(cfg *Config, item WorkItem, known *KnownSet, baseURL string) []E
 		}
 	}
 
-	raw, detectedBase := extractEndpoints(content, sourceURL, item.URL, baseURL, cfg.IncludeAssets, cfg.IncludeExternal)
+	raw, detectedBase, skippedExt := extractEndpoints(content, sourceURL, item.URL, baseURL, cfg.IncludeAssets, cfg.IncludeExternal)
 	logVerbose(cfg, "  Base URL: %s", detectedBase)
+	if skippedExt > 0 {
+		logInfo(cfg, "%s[i]%s %d absolute URL(s) skipped as external (base %s) -- re-run with --include-external (or --scope <domain>) to include", cDim, cReset, skippedExt, detectedBase)
+	}
 
 	var results []Endpoint
 	for _, ep := range raw {
@@ -534,6 +537,76 @@ type headerFlags []string
 
 func (h *headerFlags) String() string     { return strings.Join(*h, ", ") }
 func (h *headerFlags) Set(v string) error { *h = append(*h, v); return nil }
+
+// boolFlags / valueFlags: daftar flag dikenal (untuk reorder argumen).
+var boolFlags = map[string]bool{
+	"json": true, "silent": true, "v": true, "verbose": true,
+	"no-color": true, "no-source": true, "urls-only": true,
+	"fuzz": true, "curl": true, "include-assets": true, "include-external": true,
+}
+
+var valueFlags = map[string]bool{
+	"l": true, "list": true, "k": true, "known": true, "js": true,
+	"httpx-json": true, "b": true, "base": true, "scope": true,
+	"t": true, "threads": true, "delay": true, "rate": true, "ua": true,
+	"flaresolverr": true, "o": true, "output": true, "out-prefix": true,
+	"timeout": true, "body-format": true, "H": true, "header": true,
+}
+
+// reorderArgsForParsing memindahkan flag dikenal ke depan agar flag TETAP
+// terbaca walau ditulis setelah URL posisional.
+// BUGFIX: Go flag berhenti parse di argumen posisional pertama —
+// `endpoint-hunter2 <url> -o out` membuat "-o out" dianggap URL target
+// (file tidak tertulis, URL sampah ikut di-fetch).
+// Token dash yang tidak dikenal dibiarkan apa adanya (tidak diutak-atik).
+func reorderArgsForParsing(args []string) []string {
+	var flags, positional []string
+	i := 0
+	for i < len(args) {
+		a := args[i]
+		if a == "--" {
+			positional = append(positional, args[i+1:]...)
+			break
+		}
+		name := ""
+		isFlag := len(a) > 1 && a[0] == '-' && a != "-"
+		if isFlag {
+			name = a[1:]
+			if strings.HasPrefix(name, "-") {
+				name = name[1:]
+			}
+			if idx := strings.Index(name, "="); idx >= 0 {
+				name = name[:idx]
+			}
+		}
+		if isFlag && (boolFlags[name] || valueFlags[name]) {
+			flags = append(flags, a)
+			if valueFlags[name] && !strings.Contains(a, "=") {
+				if i+1 < len(args) {
+					i++
+					flags = append(flags, args[i])
+				}
+			}
+		} else if isFlag && len(a) > 2 && a[0] == '-' && a[1] != '-' && valueFlags[a[1:2]] {
+			// bentuk nempel: -oout.txt -> -o out.txt
+			flags = append(flags, a[:2], a[2:])
+		} else {
+			positional = append(positional, a)
+		}
+		i++
+	}
+	return append(flags, positional...)
+}
+
+// applyScopeImplication: --scope berarti user memercayai registrable domain
+// tsb — URL absolut in-scope di sibling subdomain (api.apps.* dari JS
+// newacadservices.*) jangan dibuang filter external. Filter scope di tahap
+// output tetap membuang semua yang di luar scope (binus-2026-09).
+func applyScopeImplication(cfg *Config) {
+	if cfg.Scope != "" {
+		cfg.IncludeExternal = true
+	}
+}
 
 func main() {
 	cfg := &Config{}
@@ -569,18 +642,23 @@ func main() {
 	flag.BoolVar(&cfg.Curl, "curl", false, "Output ready-to-run curl commands")
 	flag.StringVar(&cfg.BodyFormat, "body-format", "json", "Body format for non-GET curl: json|form|both")
 	flag.BoolVar(&cfg.IncludeAssets, "include-assets", false, "Include static asset URLs (JS/CSS/images)")
-	flag.BoolVar(&cfg.IncludeExternal, "include-external", false, "Include URLs from external domains")
+	flag.BoolVar(&cfg.IncludeExternal, "include-external", false, "Include URLs from external domains (implied when --scope is set)")
 	flag.Var(&headers, "H", "Extra HTTP header (repeatable)")
 	flag.Var(&headers, "header", "Extra HTTP header")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, banner, version)
-		fmt.Fprintf(os.Stderr, "\nUsage:\n  endpoint-hunter2 [flags] [url...]\n")
+		fmt.Fprintf(os.Stderr, "\nUsage:\n  endpoint-hunter2 [flags] [url...]  (flags may also follow URLs)\n")
 		fmt.Fprintf(os.Stderr, "  endpoint-hunter2 --httpx-json valid-urls.json --scope example.com -k all-urls.txt\n\n")
 		flag.PrintDefaults()
 	}
 
+	if len(os.Args) > 1 {
+		os.Args = append([]string{os.Args[0]}, reorderArgsForParsing(os.Args[1:])...)
+	}
 	flag.Parse()
+
+	applyScopeImplication(cfg)
 
 	cfg.ExtraHeaders = headers
 	cfg.MaxBodyBytes = int64(maxBodyMB * 1024 * 1024)

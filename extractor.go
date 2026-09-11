@@ -525,9 +525,10 @@ func validHTTPMethod(m string) bool {
 
 const ctxWindow = 500 // char di kiri/kanan match untuk ekstraksi param
 
-func extractEndpoints(content, sourceURL, jsURL, baseOverride string, includeAssets, includeExternal bool) ([]Endpoint, string) {
+func extractEndpoints(content, sourceURL, jsURL, baseOverride string, includeAssets, includeExternal bool) ([]Endpoint, string, int) {
 	var results []Endpoint
 	seen := make(map[string]bool)
+	skippedExternal := map[string]bool{}
 
 	effectiveBase := baseOverride
 	if effectiveBase == "" {
@@ -567,6 +568,7 @@ func extractEndpoints(content, sourceURL, jsURL, baseOverride string, includeAss
 				baseHost := extractHost(effectiveBase)
 				absHost := extractHost(absURL)
 				if !sameSite(baseHost, absHost) {
+					skippedExternal[strings.ToLower(absURL)] = true
 					continue
 				}
 			}
@@ -612,7 +614,7 @@ func extractEndpoints(content, sourceURL, jsURL, baseOverride string, includeAss
 			})
 		}
 	}
-	return results, effectiveBase
+	return results, effectiveBase, len(skippedExternal)
 }
 
 func extractHost(rawURL string) string {

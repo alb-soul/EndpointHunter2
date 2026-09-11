@@ -30,7 +30,7 @@ func TestExtractFamilies(t *testing.T) {
 		"const endpoint = \"/api/v2/orders\";\n" +
 		"const tpl = `/api/users/${userId}/orders`;\n" +
 		"'https://svc.example.com/lib.js'\n"
-	eps, _ := extractEndpoints(js, "https://example.com/app.js", "https://example.com/app.js", "", false, true)
+	eps, _, _ := extractEndpoints(js, "https://example.com/app.js", "https://example.com/app.js", "", false, true)
 	m := epsByURL(eps)
 	want := map[string]string{
 		"https://example.com/api/users":                 "POST",
@@ -69,7 +69,7 @@ func TestExtractFamilies(t *testing.T) {
 func TestBaseResolution(t *testing.T) {
 	// pure relative + 1 absolute API URL -> page origin wins (no hijack)
 	js := "fetch(\"/api/a\");\nfetch(\"https://api.example.com/v1/only\");\n"
-	eps, base := extractEndpoints(js, "https://example.com/a.js", "https://example.com/a.js", "", false, true)
+	eps, base, _ := extractEndpoints(js, "https://example.com/a.js", "https://example.com/a.js", "", false, true)
 	if base != "https://example.com" {
 		t.Fatalf("single absolute URL hijacked base: %s", base)
 	}
@@ -87,7 +87,7 @@ func TestBaseResolution(t *testing.T) {
 		"fetch(\"https://api.example.com/v1/b\");\n" +
 		"fetch(\"https://api.example.com/v1/c\");\n" +
 		"fetch(\"/v1/me\");\n"
-	eps2, base2 := extractEndpoints(js2, "https://example.com/a.js", "https://example.com/a.js", "", false, true)
+	eps2, base2, _ := extractEndpoints(js2, "https://example.com/a.js", "https://example.com/a.js", "", false, true)
 	if base2 != "https://api.example.com" {
 		t.Fatalf("strong signal should override base, got %s", base2)
 	}
@@ -107,7 +107,7 @@ func TestModernFetchWrappers(t *testing.T) {
 		"const r2 = await $fetch(`https://api.example.com/v1/dollar`, {method: 'POST'});\n" +
 		"const r3 = await ky.post(\"/api/kything\");\n" +
 		"const r4 = await ky.get(\"https://api.example.com/v1/kyget\");\n"
-	eps, _ := extractEndpoints(js, "https://example.com/a.js", "https://example.com/a.js", "", false, true)
+	eps, _, _ := extractEndpoints(js, "https://example.com/a.js", "https://example.com/a.js", "", false, true)
 	m := epsByURL(eps)
 	for _, u := range []string{
 		"https://example.com/api/ofetch-data",
@@ -122,7 +122,7 @@ func TestModernFetchWrappers(t *testing.T) {
 
 func TestWebSocketScheme(t *testing.T) {
 	js := "const ws = new WebSocket(\"wss://example.com/socket.io/?EIO=4\");\n"
-	eps, _ := extractEndpoints(js, "https://example.com/a.js", "https://example.com/a.js", "", false, true)
+	eps, _, _ := extractEndpoints(js, "https://example.com/a.js", "https://example.com/a.js", "", false, true)
 	found := false
 	for _, e := range eps {
 		if strings.HasPrefix(e.AbsURL, "wss://example.com/socket.io") {
@@ -136,7 +136,7 @@ func TestWebSocketScheme(t *testing.T) {
 
 func TestCaseSensitiveDedup(t *testing.T) {
 	js := "fetch(\"/API/Users\");\nfetch(\"/api/users\");\n"
-	eps, _ := extractEndpoints(js, "https://example.com/a.js", "https://example.com/a.js", "", false, true)
+	eps, _, _ := extractEndpoints(js, "https://example.com/a.js", "https://example.com/a.js", "", false, true)
 	if len(eps) != 2 {
 		t.Errorf("case-differing paths merged: got %d want 2", len(eps))
 	}
@@ -144,7 +144,7 @@ func TestCaseSensitiveDedup(t *testing.T) {
 
 func TestExternalSLD(t *testing.T) {
 	js := "fetch(\"https://evil.co.uk/api/steal\");\nfetch(\"https://api.example.co.uk/api/ok\");\n"
-	eps, _ := extractEndpoints(js, "https://example.co.uk/app.js", "https://example.co.uk/app.js", "", false, false)
+	eps, _, _ := extractEndpoints(js, "https://example.co.uk/app.js", "https://example.co.uk/app.js", "", false, false)
 	m := epsByURL(eps)
 	if _, ok := m["https://evil.co.uk/api/steal"]; ok {
 		t.Errorf("evil.co.uk kept as same-site (naive SLD)")
@@ -156,7 +156,7 @@ func TestExternalSLD(t *testing.T) {
 
 func TestProtoRelativeScheme(t *testing.T) {
 	js := "var endpoint = \"//svc.example.com/lib/api/data\";\n"
-	eps, _ := extractEndpoints(js, "http://example.com/a.js", "http://example.com/a.js", "", false, true)
+	eps, _, _ := extractEndpoints(js, "http://example.com/a.js", "http://example.com/a.js", "", false, true)
 	found := false
 	for _, e := range eps {
 		if strings.HasPrefix(e.AbsURL, "http://svc.example.com/") {
@@ -173,7 +173,7 @@ func TestProtoRelativeScheme(t *testing.T) {
 
 func TestMethodWhitelist(t *testing.T) {
 	js := "router.use(\"/api/mw2\");\n"
-	eps, _ := extractEndpoints(js, "https://example.com/a.js", "https://example.com/a.js", "", false, true)
+	eps, _, _ := extractEndpoints(js, "https://example.com/a.js", "https://example.com/a.js", "", false, true)
 	for _, e := range eps {
 		if e.Method != "GET" && e.Method != "POST" && e.Method != "PUT" && e.Method != "PATCH" && e.Method != "DELETE" && e.Method != "HEAD" && e.Method != "OPTIONS" {
 			t.Errorf("non-HTTP method leaked: %s", e.Method)
@@ -228,7 +228,7 @@ func TestMatchesScopeAndSelfFilter(t *testing.T) {
 	if matchesScope("https://example.com.evil.com/a", "example.com") {
 		t.Errorf("suffix trick passed scope")
 	}
-	eps, _ := extractEndpoints(
+	eps, _, _ := extractEndpoints(
 		"fetch(\"https://example.com/app.js\");\nfetch(\"/api/x\");\n",
 		"https://example.com/app.js", "https://example.com/app.js", "", false, true)
 	for _, e := range eps {
@@ -247,7 +247,7 @@ func TestBinusBaseHijack(t *testing.T) {
 		`apiNotifReportToken="https://api.apps.binus.ac.id/e2es/auth/token",` +
 		`apiDSAToken="https://api.apps.binus.ac.id/digital_school/auth/token",` +
 		`apiExamToken="https://api.apps.binus.ac.id/exam/status";`
-	eps, base := extractEndpoints(js,
+	eps, base, _ := extractEndpoints(js,
 		"https://newacadservices.apps.binus.ac.id/assets/app.js",
 		"https://newacadservices.apps.binus.ac.id/assets/app.js", "", false, false)
 	if strings.Contains(base, "LoginAD") {
@@ -261,5 +261,48 @@ func TestBinusBaseHijack(t *testing.T) {
 		if _, ok := m[u]; !ok {
 			t.Errorf("missing endpoint %s (base=%s)", u, base)
 		}
+	}
+}
+
+func TestReorderArgsAfterURL(t *testing.T) {
+	got := reorderArgsForParsing([]string{"https://x/y.js", "-o", "out.txt", "-silent"})
+	want := []string{"-o", "out.txt", "-silent", "https://x/y.js"}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("reorder = %q want %q", got, want)
+	}
+	got2 := reorderArgsForParsing([]string{"-H", "Cookie: a=b", "https://x/y.js", "--scope", "binus.ac.id"})
+	want2 := []string{"-H", "Cookie: a=b", "--scope", "binus.ac.id", "https://x/y.js"}
+	if strings.Join(got2, "\x00") != strings.Join(want2, "\x00") {
+		t.Fatalf("reorder2 = %q want %q", got2, want2)
+	}
+	got3 := reorderArgsForParsing([]string{"https://x/y.js", "-oout.txt"})
+	want3 := []string{"-o", "out.txt", "https://x/y.js"}
+	if strings.Join(got3, "\x00") != strings.Join(want3, "\x00") {
+		t.Fatalf("reorder3 = %q want %q", got3, want3)
+	}
+}
+
+func TestScopeImpliesExternal(t *testing.T) {
+	c := &Config{}
+	applyScopeImplication(c)
+	if c.IncludeExternal {
+		t.Fatalf("empty scope must not imply external")
+	}
+	c.Scope = "binus.ac.id"
+	applyScopeImplication(c)
+	if !c.IncludeExternal {
+		t.Fatalf("scope must imply include-external")
+	}
+}
+
+func TestExternalDropCounted(t *testing.T) {
+	js := "fetch(\"https://api.other.com/v1/x\");\nfetch(\"/api/local\");\n"
+	_, _, skipped := extractEndpoints(js, "https://example.com/a.js", "https://example.com/a.js", "", false, false)
+	if skipped != 1 {
+		t.Fatalf("skippedExternal = %d want 1", skipped)
+	}
+	_, _, skipped2 := extractEndpoints(js, "https://example.com/a.js", "https://example.com/a.js", "", false, true)
+	if skipped2 != 0 {
+		t.Fatalf("skippedExternal with includeExternal = %d want 0", skipped2)
 	}
 }
