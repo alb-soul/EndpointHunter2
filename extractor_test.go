@@ -282,19 +282,6 @@ func TestReorderArgsAfterURL(t *testing.T) {
 	}
 }
 
-func TestScopeImpliesExternal(t *testing.T) {
-	c := &Config{}
-	applyScopeImplication(c)
-	if c.IncludeExternal {
-		t.Fatalf("empty scope must not imply external")
-	}
-	c.Scope = "binus.ac.id"
-	applyScopeImplication(c)
-	if !c.IncludeExternal {
-		t.Fatalf("scope must imply include-external")
-	}
-}
-
 func TestExternalDropCounted(t *testing.T) {
 	js := "fetch(\"https://api.other.com/v1/x\");\nfetch(\"/api/local\");\n"
 	_, _, skipped := extractEndpoints(js, "https://example.com/a.js", "https://example.com/a.js", "", false, false)
@@ -304,5 +291,75 @@ func TestExternalDropCounted(t *testing.T) {
 	_, _, skipped2 := extractEndpoints(js, "https://example.com/a.js", "https://example.com/a.js", "", false, true)
 	if skipped2 != 0 {
 		t.Fatalf("skippedExternal with includeExternal = %d want 0", skipped2)
+	}
+}
+
+func TestRegistrableDomain(t *testing.T) {
+	cases := map[string]string{
+		"api.apps.binus.ac.id":             "binus.ac.id",
+		"newacadservices.apps.binus.ac.id": "binus.ac.id",
+		"binus.ac.id":                      "binus.ac.id",
+		"api.example.co.uk":                "example.co.uk",
+		"10.0.0.5":                         "10.0.0.5",
+		"example.com:8443":                 "example.com",
+		"localhost":                        "localhost",
+		"evil.co.id":                       "evil.co.id",
+		"target.co.id":                     "target.co.id",
+	}
+	for in, want := range cases {
+		if got := registrableDomain(in); got != want {
+			t.Errorf("registrableDomain(%q) = %q want %q", in, got, want)
+		}
+	}
+}
+
+func TestPassScopeFilterModes(t *testing.T) {
+	api := "https://api.apps.binus.ac.id/letter_request/auth/token"
+	front := "https://acadservices.apps.binus.ac.id/acadservices/x"
+	src := "newacadservices.apps.binus.ac.id"
+	mk := func() *Config { return &Config{} }
+
+	// default luas
+	if !passScopeFilter(mk(), api, "") || !passScopeFilter(mk(), front, "") {
+		t.Fatalf("default must keep everything")
+	}
+	// --scope D (D + turunan)
+	c := mk()
+	c.Scope = "binus.ac.id"
+	if !passScopeFilter(c, api, "") || !passScopeFilter(c, front, "") {
+		t.Fatalf("--scope binus.ac.id must keep subdomains")
+	}
+	if passScopeFilter(c, "https://evil.com/api/x", "") {
+		t.Fatalf("--scope must drop out-of-scope")
+	}
+	// --scope D --scope-exact (tepat D saja)
+	c2 := mk()
+	c2.Scope, c2.ScopeExact = "binus.ac.id", true
+	if !passScopeFilter(c2, "https://binus.ac.id/x", "") {
+		t.Fatalf("exact must keep apex")
+	}
+	if passScopeFilter(c2, api, "") {
+		t.Fatalf("exact must drop subdomains")
+	}
+	// --scope sub --scope-exact (tepat satu host)
+	c3 := mk()
+	c3.Scope, c3.ScopeExact = "api.apps.binus.ac.id", true
+	if !passScopeFilter(c3, api, "") || passScopeFilter(c3, front, "") {
+		t.Fatalf("exact subdomain scoping wrong")
+	}
+	// -bs (regdom sumber)
+	c4 := mk()
+	c4.BaseScope = true
+	if !passScopeFilter(c4, api, src) || !passScopeFilter(c4, front, src) {
+		t.Fatalf("-bs must keep same-regdom siblings")
+	}
+	if passScopeFilter(c4, "https://api.other.id/x", src) {
+		t.Fatalf("-bs must drop other regdom")
+	}
+	// -bs + --scope-exact (tepat host sumber)
+	c5 := mk()
+	c5.BaseScope, c5.ScopeExact = true, true
+	if passScopeFilter(c5, api, src) {
+		t.Fatalf("-bs exact must drop sibling (only source host)")
 	}
 }

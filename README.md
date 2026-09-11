@@ -12,7 +12,7 @@
 - **FlareSolverr integration** — Cloudflare-protected targets are solved automatically. Cookie sessions are cached per-domain and **re-solved on 403/429** (expired cookies).
 - **Auto base-URL detection** — picks up `axios.defaults.baseURL`, `baseUrl`, `VUE_APP_*`, `process.env.* || "..."` etc., so relative paths resolve accurately.
 - **Interest scoring** — each endpoint is ranked `HIGH` / `MED` / `LOW` by path keywords.
-- **Scope & noise control** — `--scope`, external-domain filtering (same-SLD by default), static-asset filtering, and a known-endpoints filter (`-k`) to surface only *new* routes.
+- **Scope & noise control** — default luas (semua URL absolut terlist, termasuk sibling subdomain); `--scope` / `--scope-exact` / `-bs` untuk menyempit, static-asset filtering, dan known-endpoints filter (`-k`).
 - **Param extraction** — query params, path params (`{id}`, `/:id`), template vars, and body params (kinda guessable from `body:`/`data:`/`params:` objects) are captured.
 - **Multi-format output** — colored table, plain URLs, JSON, ready-to-run `curl` commands with FUZZ-injected params and body, plus a one-command **multi-stream** `--out-prefix` (`<p>.txt` / `<p>.jsonl` / `<p>.curl.sh`).
 - **Fuzz mode** — `{param}` placeholders are rewritten to `FUZZ` for direct use with ffuf/nuclei.
@@ -94,7 +94,9 @@ endpoint-hunter2 -js app.js --out-prefix out    # out.txt + out.jsonl + out.curl
 | `-js` | Local JS file to analyze |
 | `--httpx-json` | JSONL from `httpx -json -irr` (body-reuse, no fetch). `-` = stdin |
 | `-b, -base` | Base URL override for resolving relative paths |
-| `--scope` | Only output endpoints matching domain / `*.domain` |
+| `--scope` | Only `D` + `*.D` (tanpa flag lain = semua tampil) |
+| `--scope-exact` | Dengan `--scope`/`-bs`: tepat satu host (tanpa subdomain) |
+| `-bs`, `--base-scope` | Scope otomatis = registrable domain host input (per source record) |
 | `-t, -threads` | Concurrency (default 20) |
 | `--rate` | Max requests/second (0 = unlimited) |
 | `--delay` | ms delay between requests (used only when `--rate` is off) |
@@ -103,7 +105,7 @@ endpoint-hunter2 -js app.js --out-prefix out    # out.txt + out.jsonl + out.curl
 | `--timeout` | Request timeout seconds (default 7) |
 | `-ua` | Custom User-Agent |
 | `--include-assets` | Include static asset URLs (JS/CSS/images) |
-| `--include-external` | Include URLs from external domains |
+| `--include-external` | On by default (redundan; tetap diterima). `--include-external=false` = perilaku strict lama |
 | `--urls-only` | Plain URLs, one per line |
 | `--json` | JSON output |
 | `--curl` | Curl command output |

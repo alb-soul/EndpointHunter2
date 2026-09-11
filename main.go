@@ -28,6 +28,7 @@ import (
 	"os/signal"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -76,6 +77,8 @@ type Config struct {
 	LocalJS         string
 	BaseURL         string
 	Scope           string
+	ScopeExact      bool   // --scope-exact: host harus sama persis (tanpa subdomain)
+	BaseScope       bool   // -bs/--base-scope: scope otomatis dari registrable domain input
 	HTTPXJSON       string // v2: JSONL dari httpx -json -irr
 	Threads         int
 	DelayMs         int
@@ -515,12 +518,16 @@ func processURL(cfg *Config, item WorkItem, known *KnownSet, baseURL string) []E
 		logInfo(cfg, "%s[i]%s %d absolute URL(s) skipped as external (base %s) -- re-run with --include-external (or --scope <domain>) to include", cDim, cReset, skippedExt, detectedBase)
 	}
 
+	scopeSrc := ""
+	if cfg.BaseScope {
+		scopeSrc = scopeHostForItem(cfg, item)
+	}
 	var results []Endpoint
 	for _, ep := range raw {
 		if ep.AbsURL == "" || ep.AbsURL == item.URL {
 			continue
 		}
-		if cfg.Scope != "" && !matchesScope(ep.AbsURL, cfg.Scope) {
+		if !passScopeFilter(cfg, ep.AbsURL, scopeSrc) {
 			continue
 		}
 		if known.Contains(ep.AbsURL) {
@@ -543,6 +550,7 @@ var boolFlags = map[string]bool{
 	"json": true, "silent": true, "v": true, "verbose": true,
 	"no-color": true, "no-source": true, "urls-only": true,
 	"fuzz": true, "curl": true, "include-assets": true, "include-external": true,
+	"bs": true, "base-scope": true, "scope-exact": true,
 }
 
 var valueFlags = map[string]bool{
@@ -598,16 +606,6 @@ func reorderArgsForParsing(args []string) []string {
 	return append(flags, positional...)
 }
 
-// applyScopeImplication: --scope berarti user memercayai registrable domain
-// tsb — URL absolut in-scope di sibling subdomain (api.apps.* dari JS
-// newacadservices.*) jangan dibuang filter external. Filter scope di tahap
-// output tetap membuang semua yang di luar scope (binus-2026-09).
-func applyScopeImplication(cfg *Config) {
-	if cfg.Scope != "" {
-		cfg.IncludeExternal = true
-	}
-}
-
 func main() {
 	cfg := &Config{}
 	var headers headerFlags
@@ -620,7 +618,10 @@ func main() {
 	flag.StringVar(&cfg.HTTPXJSON, "httpx-json", "", "Read {url,body} from httpx -json -irr JSONL (body-reuse, no fetch)")
 	flag.StringVar(&cfg.BaseURL, "b", "", "Base URL for resolving relative paths")
 	flag.StringVar(&cfg.BaseURL, "base", "", "Base URL for resolving relative paths")
-	flag.StringVar(&cfg.Scope, "scope", "", "Only output endpoints matching this domain (includes *.domain)")
+	flag.StringVar(&cfg.Scope, "scope", "", "Only output endpoints on this domain + subdomains (D + *.D)")
+	flag.BoolVar(&cfg.ScopeExact, "scope-exact", false, "With --scope/-bs: exact host only (no subdomains)")
+	flag.BoolVar(&cfg.BaseScope, "bs", false, "Auto-scope: registrable domain of input host (per source record)")
+	flag.BoolVar(&cfg.BaseScope, "base-scope", false, "Alias of -bs")
 	flag.IntVar(&cfg.Threads, "t", 20, "Number of concurrent threads")
 	flag.IntVar(&cfg.Threads, "threads", 20, "Number of concurrent threads")
 	flag.IntVar(&cfg.DelayMs, "delay", 0, "Delay between requests in milliseconds")
@@ -642,7 +643,7 @@ func main() {
 	flag.BoolVar(&cfg.Curl, "curl", false, "Output ready-to-run curl commands")
 	flag.StringVar(&cfg.BodyFormat, "body-format", "json", "Body format for non-GET curl: json|form|both")
 	flag.BoolVar(&cfg.IncludeAssets, "include-assets", false, "Include static asset URLs (JS/CSS/images)")
-	flag.BoolVar(&cfg.IncludeExternal, "include-external", false, "Include URLs from external domains (implied when --scope is set)")
+	flag.BoolVar(&cfg.IncludeExternal, "include-external", true, "Include URLs from external domains (default true; narrow with --scope/-bs)")
 	flag.Var(&headers, "H", "Extra HTTP header (repeatable)")
 	flag.Var(&headers, "header", "Extra HTTP header")
 
@@ -657,8 +658,6 @@ func main() {
 		os.Args = append([]string{os.Args[0]}, reorderArgsForParsing(os.Args[1:])...)
 	}
 	flag.Parse()
-
-	applyScopeImplication(cfg)
 
 	cfg.ExtraHeaders = headers
 	cfg.MaxBodyBytes = int64(maxBodyMB * 1024 * 1024)
@@ -984,6 +983,96 @@ func applyFuzz(u string) string {
 }
 
 // matchesScope: host == scope atau *.scope
+// twoPartPublicSuffix: suffix publik 2-label umum (terutama .id) — bila
+// 2-label terakhir cocok, pakai 3 label agar evil.co.id != target.co.id.
+var twoPartPublicSuffix = map[string]bool{
+	"ac.id": true, "co.id": true, "or.id": true, "go.id": true,
+	"mil.id": true, "net.id": true, "web.id": true, "my.id": true,
+	"biz.id": true, "ponpes.id": true, "co.uk": true, "org.uk": true,
+	"me.uk": true, "ltd.uk": true, "plc.uk": true, "com.au": true,
+	"net.au": true, "org.au": true, "co.jp": true, "ne.jp": true,
+	"or.jp": true, "co.in": true, "com.br": true, "com.sg": true,
+	"co.za": true, "com.my": true,
+}
+
+// registrableDomain: aproksimasi cerdas (api.apps.binus.ac.id -> binus.ac.id).
+// IP/v6 kembali utuh, port dibuang.
+func registrableDomain(host string) string {
+	h := strings.ToLower(strings.TrimSuffix(host, "."))
+	if i := strings.LastIndex(h, ":"); i >= 0 && !strings.Contains(h[i:], "]") {
+		// hati-hati IPv6: hanya strip port berbentuk :angka di akhir
+		if _, err := strconv.Atoi(h[i+1:]); err == nil {
+			h = h[:i]
+		}
+	}
+	h = strings.Trim(h, "[]")
+	if strings.Contains(h, ":") {
+		return h // IPv6 -> utuh
+	}
+	parts := strings.Split(h, ".")
+	allNum := len(parts) == 4
+	for _, p := range parts {
+		if _, err := strconv.Atoi(p); err != nil {
+			allNum = false
+			break
+		}
+	}
+	if allNum {
+		return h // IPv4 -> utuh
+	}
+	if len(parts) >= 2 {
+		last2 := parts[len(parts)-2] + "." + parts[len(parts)-1]
+		if twoPartPublicSuffix[last2] && len(parts) >= 3 {
+			return parts[len(parts)-3] + "." + last2
+		}
+		return last2
+	}
+	return h
+}
+
+// scopeHostForItem: host acuan mode -bs — -b bila ada, else host URL sumber.
+func scopeHostForItem(cfg *Config, item WorkItem) string {
+	if cfg.BaseURL != "" {
+		return extractHost(cfg.BaseURL)
+	}
+	if strings.HasPrefix(item.URL, "http://") || strings.HasPrefix(item.URL, "https://") {
+		return extractHost(item.URL)
+	}
+	return ""
+}
+
+// passScopeFilter: default luas (tanpa flag scope -> semua lolos).
+// --scope D [+ --scope-exact] dan -bs (union) — lolos bila SALAH SATU cocok.
+func passScopeFilter(cfg *Config, absURL, scopeSrcHost string) bool {
+	if cfg.Scope == "" && scopeSrcHost == "" {
+		return true
+	}
+	h := extractHost(absURL)
+	if cfg.Scope != "" {
+		if cfg.ScopeExact {
+			if h != "" && h == strings.ToLower(strings.TrimSuffix(cfg.Scope, ".")) {
+				return true
+			}
+		} else if matchesScope(absURL, cfg.Scope) {
+			return true
+		}
+		if scopeSrcHost == "" {
+			return false
+		}
+	}
+	if scopeSrcHost != "" {
+		if h == "" {
+			return false
+		}
+		if cfg.ScopeExact {
+			return h == strings.ToLower(scopeSrcHost)
+		}
+		rh, rs := registrableDomain(h), registrableDomain(scopeSrcHost)
+		return rh != "" && rh == rs
+	}
+	return false
+}
+
 func matchesScope(rawURL, scope string) bool {
 	u, err := url.Parse(rawURL)
 	if err != nil {
