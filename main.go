@@ -77,9 +77,9 @@ type Config struct {
 	LocalJS         string
 	BaseURL         string
 	Scope           string
-	ScopeExact      bool   // --scope-exact: host harus sama persis (tanpa subdomain)
-	BaseScope       bool   // -bs/--base-scope: scope otomatis dari registrable domain input
-	HTTPXJSON       string // v2: JSONL dari httpx -json -irr
+	ScopeExact      exactScopeValue // --scope-exact: bare=modifier, =Ddomain=tepat D
+	BaseScope       bool            // -bs/--base-scope: scope otomatis dari registrable domain input
+	HTTPXJSON       string          // v2: JSONL dari httpx -json -irr
 	Threads         int
 	DelayMs         int
 	RatePerSec      float64
@@ -588,11 +588,24 @@ func reorderArgsForParsing(args []string) []string {
 			}
 		}
 		if isFlag && (boolFlags[name] || valueFlags[name]) {
-			flags = append(flags, a)
-			if valueFlags[name] && !strings.Contains(a, "=") {
-				if i+1 < len(args) {
+			if name == "scope-exact" && !strings.Contains(a, "=") && i+1 < len(args) {
+				// `--scope-exact api.x` (spasi): makan token berikut sbg domain,
+				// KECUALI bila ia jelas URL target (ada :// atau /) atau flag.
+				// Bentuk `=` (`--scope-exact=api.x`) selalu aman & disarankan.
+				nxt := args[i+1]
+				if nxt != "" && !strings.HasPrefix(nxt, "-") && !strings.Contains(nxt, "://") && !strings.Contains(nxt, "/") {
 					i++
-					flags = append(flags, args[i])
+					flags = append(flags, "--scope-exact="+nxt)
+				} else {
+					flags = append(flags, a)
+				}
+			} else {
+				flags = append(flags, a)
+				if valueFlags[name] && !strings.Contains(a, "=") {
+					if i+1 < len(args) {
+						i++
+						flags = append(flags, args[i])
+					}
 				}
 			}
 		} else if isFlag && len(a) > 2 && a[0] == '-' && a[1] != '-' && valueFlags[a[1:2]] {
@@ -619,7 +632,7 @@ func main() {
 	flag.StringVar(&cfg.BaseURL, "b", "", "Base URL for resolving relative paths")
 	flag.StringVar(&cfg.BaseURL, "base", "", "Base URL for resolving relative paths")
 	flag.StringVar(&cfg.Scope, "scope", "", "Only output endpoints on this domain + subdomains (D + *.D)")
-	flag.BoolVar(&cfg.ScopeExact, "scope-exact", false, "With --scope/-bs: exact host only (no subdomains)")
+	flag.Var(&cfg.ScopeExact, "scope-exact", "Exact host only: `--scope-exact api.x.com` (space/=), or bare modifier for --scope/-bs")
 	flag.BoolVar(&cfg.BaseScope, "bs", false, "Auto-scope: registrable domain of input host (per source record)")
 	flag.BoolVar(&cfg.BaseScope, "base-scope", false, "Alias of -bs")
 	flag.IntVar(&cfg.Threads, "t", 20, "Number of concurrent threads")
@@ -1041,34 +1054,73 @@ func scopeHostForItem(cfg *Config, item WorkItem) string {
 	return ""
 }
 
+// exactScopeValue: --scope-exact dua bentuk —
+//
+//	bare (`--scope-exact`)         -> modifier: exact-kan --scope / -bs
+//	nilai (`--scope-exact=api.x`)  -> tepat host itu (single-flag, tanpa --scope)
+//
+// IsBoolFlag agar bentuk bare valid; bentuk spasi (`--scope-exact api.x`)
+// TIDAK didukung (api.x akan dianggap URL target) — pakai `=`.
+type exactScopeValue struct {
+	set      bool
+	modifier bool
+	domain   string
+}
+
+func (v *exactScopeValue) String() string { return v.domain }
+func (v *exactScopeValue) Set(s string) error {
+	v.set = true
+	switch {
+	case s == "true":
+		v.modifier = true
+	case s == "false":
+		v.set, v.modifier, v.domain = false, false, ""
+	default:
+		v.domain = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(s), "."))
+	}
+	return nil
+}
+func (v *exactScopeValue) IsBoolFlag() bool { return true }
+
+func normScopeHost(scope string) string {
+	return strings.ToLower(strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(scope), "*."), "."))
+}
+
 // passScopeFilter: default luas (tanpa flag scope -> semua lolos).
 // --scope D [+ --scope-exact] dan -bs (union) — lolos bila SALAH SATU cocok.
 func passScopeFilter(cfg *Config, absURL, scopeSrcHost string) bool {
-	if cfg.Scope == "" && scopeSrcHost == "" {
-		return true
-	}
 	h := extractHost(absURL)
-	if cfg.Scope != "" {
-		if cfg.ScopeExact {
-			if h != "" && h == strings.ToLower(strings.TrimSuffix(cfg.Scope, ".")) {
-				return true
-			}
-		} else if matchesScope(absURL, cfg.Scope) {
+	ex := cfg.ScopeExact
+	// 1. --scope-exact=D : tepat host D (single-flag)
+	if ex.set && ex.domain != "" {
+		if h != "" && h == ex.domain {
 			return true
 		}
-		if scopeSrcHost == "" {
-			return false
+	}
+	// 2. bare --scope-exact : exact-kan --scope / -bs (subtree ikut mati)
+	if ex.set && ex.domain == "" && ex.modifier {
+		if cfg.Scope != "" {
+			return h != "" && h == normScopeHost(cfg.Scope)
+		}
+		if scopeSrcHost != "" {
+			return h != "" && h == strings.ToLower(scopeSrcHost)
+		}
+		// modifier tanpa scope/bs: no-op -> lanjut ke aturan umum
+	}
+	// 3. subtree --scope D (D + *.D)
+	if cfg.Scope != "" && matchesScope(absURL, cfg.Scope) {
+		return true
+	}
+	// 4. -bs : regdom sumber
+	if cfg.BaseScope && scopeSrcHost != "" && h != "" {
+		rh, rs := registrableDomain(h), registrableDomain(scopeSrcHost)
+		if rh != "" && rh == rs {
+			return true
 		}
 	}
-	if scopeSrcHost != "" {
-		if h == "" {
-			return false
-		}
-		if cfg.ScopeExact {
-			return h == strings.ToLower(scopeSrcHost)
-		}
-		rh, rs := registrableDomain(h), registrableDomain(scopeSrcHost)
-		return rh != "" && rh == rs
+	// 5. default luas: tanpa constraint
+	if cfg.Scope == "" && scopeSrcHost == "" && !(ex.set && ex.domain != "") {
+		return true
 	}
 	return false
 }

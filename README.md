@@ -95,7 +95,7 @@ endpoint-hunter2 -js app.js --out-prefix out    # out.txt + out.jsonl + out.curl
 | `--httpx-json` | JSONL from `httpx -json -irr` (body-reuse, no fetch). `-` = stdin |
 | `-b, -base` | Base URL override for resolving relative paths |
 | `--scope` | Only `D` + `*.D` (tanpa flag lain = semua tampil) |
-| `--scope-exact` | Dengan `--scope`/`-bs`: tepat satu host (tanpa subdomain) |
+| `--scope-exact D` | Tepat satu host `D` (single-flag; spasi/`=`). Bare `--scope-exact` = modifier exact untuk `--scope`/`-bs` |
 | `-bs`, `--base-scope` | Scope otomatis = registrable domain host input (per source record) |
 | `-t, -threads` | Concurrency (default 20) |
 | `--rate` | Max requests/second (0 = unlimited) |

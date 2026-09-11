@@ -280,6 +280,17 @@ func TestReorderArgsAfterURL(t *testing.T) {
 	if strings.Join(got3, "\x00") != strings.Join(want3, "\x00") {
 		t.Fatalf("reorder3 = %q want %q", got3, want3)
 	}
+	got4 := reorderArgsForParsing([]string{"--scope-exact", "api.x.com", "https://x/y.js"})
+	want4 := []string{"--scope-exact=api.x.com", "https://x/y.js"}
+	if strings.Join(got4, "\x00") != strings.Join(want4, "\x00") {
+		t.Fatalf("reorder4 = %q want %q", got4, want4)
+	}
+	// URL target setelah --scope-exact jangan dimakan
+	got5 := reorderArgsForParsing([]string{"--scope-exact", "https://x/y.js"})
+	want5 := []string{"--scope-exact", "https://x/y.js"}
+	if strings.Join(got5, "\x00") != strings.Join(want5, "\x00") {
+		t.Fatalf("reorder5 = %q want %q", got5, want5)
+	}
 }
 
 func TestExternalDropCounted(t *testing.T) {
@@ -332,20 +343,33 @@ func TestPassScopeFilterModes(t *testing.T) {
 	if passScopeFilter(c, "https://evil.com/api/x", "") {
 		t.Fatalf("--scope must drop out-of-scope")
 	}
-	// --scope D --scope-exact (tepat D saja)
+	// --scope-exact=D single-flag (tepat D saja, tanpa --scope)
 	c2 := mk()
-	c2.Scope, c2.ScopeExact = "binus.ac.id", true
+	if err := c2.ScopeExact.Set("binus.ac.id"); err != nil {
+		t.Fatal(err)
+	}
 	if !passScopeFilter(c2, "https://binus.ac.id/x", "") {
 		t.Fatalf("exact must keep apex")
 	}
 	if passScopeFilter(c2, api, "") {
 		t.Fatalf("exact must drop subdomains")
 	}
-	// --scope sub --scope-exact (tepat satu host)
+	// --scope-exact=sub single-flag (tepat satu host)
 	c3 := mk()
-	c3.Scope, c3.ScopeExact = "api.apps.binus.ac.id", true
+	if err := c3.ScopeExact.Set("api.apps.binus.ac.id"); err != nil {
+		t.Fatal(err)
+	}
 	if !passScopeFilter(c3, api, "") || passScopeFilter(c3, front, "") {
 		t.Fatalf("exact subdomain scoping wrong")
+	}
+	// bentuk lama tetap jalan: --scope D + bare --scope-exact
+	c3b := mk()
+	c3b.Scope = "binus.ac.id"
+	if err := c3b.ScopeExact.Set("true"); err != nil {
+		t.Fatal(err)
+	}
+	if !passScopeFilter(c3b, "https://binus.ac.id/x", "") || passScopeFilter(c3b, api, "") {
+		t.Fatalf("bare modifier must pin --scope to exact")
 	}
 	// -bs (regdom sumber)
 	c4 := mk()
@@ -356,10 +380,16 @@ func TestPassScopeFilterModes(t *testing.T) {
 	if passScopeFilter(c4, "https://api.other.id/x", src) {
 		t.Fatalf("-bs must drop other regdom")
 	}
-	// -bs + --scope-exact (tepat host sumber)
+	// -bs + bare --scope-exact (tepat host sumber)
 	c5 := mk()
-	c5.BaseScope, c5.ScopeExact = true, true
+	c5.BaseScope = true
+	if err := c5.ScopeExact.Set("true"); err != nil {
+		t.Fatal(err)
+	}
 	if passScopeFilter(c5, api, src) {
 		t.Fatalf("-bs exact must drop sibling (only source host)")
+	}
+	if !passScopeFilter(c5, "https://newacadservices.apps.binus.ac.id/y", src) {
+		t.Fatalf("-bs exact must keep source host itself")
 	}
 }
