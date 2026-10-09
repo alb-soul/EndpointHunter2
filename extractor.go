@@ -91,6 +91,54 @@ var extractionPatterns = []ExtractionPattern{
 		DefaultMethod: "GET",
 	},
 	{
+		Name:          "axios.request-method-url",
+		Regex:         regexp.MustCompile(`\baxios\s*\.\s*request\s*\(\s*\{[^}]{0,200}method\s*:\s*['"]([A-Za-z]+)['"]\s*,?[^}]{0,200}url\s*:\s*` + bt + `([^` + bte + `\s]{4,})` + bt),
+		URLGroup:      2,
+		MethodGroup:   1,
+		DefaultMethod: "GET",
+	},
+	{
+		Name:          "axios.request-url-method",
+		Regex:         regexp.MustCompile(`\baxios\s*\.\s*request\s*\(\s*\{[^}]{0,200}url\s*:\s*` + bt + `([^` + bte + `\s]{4,})` + bt + `[^}]{0,200}method\s*:\s*['"]([A-Za-z]+)['"]`),
+		URLGroup:      1,
+		MethodGroup:   2,
+		DefaultMethod: "GET",
+	},
+	{
+		Name:          "axios.request-url",
+		Regex:         regexp.MustCompile(`\baxios\s*\.\s*request\s*\(\s*\{[^}]{0,200}url\s*:\s*` + bt + `([^` + bte + `\s]{4,})` + bt),
+		URLGroup:      1,
+		DefaultMethod: "GET",
+	},
+	{
+		Name:          "instance-method (api/client/...)",
+		Regex:         regexp.MustCompile(`\b(?:api|client|service|axiosInstance|instance|request|httpClient|got)\s*\.\s*(get|post|put|delete|patch|head|options)\s*\(\s*` + bt + `([^` + bte + `\s]{4,})` + bt),
+		URLGroup:      2,
+		MethodGroup:   1,
+		DefaultMethod: "GET",
+	},
+	{
+		Name:          "$http.method (AngularJS)",
+		Regex:         regexp.MustCompile(`\$http\s*\.\s*(get|post|put|delete|patch|head)\s*\(\s*` + bt + `([^` + bte + `\s]{4,})` + bt),
+		URLGroup:      2,
+		MethodGroup:   1,
+		DefaultMethod: "GET",
+	},
+	{
+		Name:          "$http(config)-method-url",
+		Regex:         regexp.MustCompile(`\$http\s*\(\s*\{[^}]{0,200}method\s*:\s*['"]([A-Za-z]+)['"]\s*,?[^}]{0,200}url\s*:\s*` + bt + `([^` + bte + `\s]{4,})` + bt),
+		URLGroup:      2,
+		MethodGroup:   1,
+		DefaultMethod: "GET",
+	},
+	{
+		Name:          "$http(config)-url-method",
+		Regex:         regexp.MustCompile(`\$http\s*\(\s*\{[^}]{0,200}url\s*:\s*` + bt + `([^` + bte + `\s]{4,})` + bt + `[^}]{0,200}method\s*:\s*['"]([A-Za-z]+)['"]`),
+		URLGroup:      1,
+		MethodGroup:   2,
+		DefaultMethod: "GET",
+	},
+	{
 		Name:          "XHR.open",
 		Regex:         regexp.MustCompile(`\.open\s*\(\s*['"]([A-Z]+)['"]\s*,\s*` + bt + `([^` + bte + `\s]{4,})` + bt),
 		URLGroup:      2,
@@ -153,7 +201,7 @@ var (
 	reQueryParam   = regexp.MustCompile(`[?&]([a-zA-Z_][a-zA-Z0-9_\-]*)=`)
 	rePathParam    = regexp.MustCompile(`\{([a-zA-Z_][a-zA-Z0-9_]*)\}|/:([a-zA-Z_][a-zA-Z0-9_]*)`)
 	reTemplateVar  = regexp.MustCompile(`\$\{([a-zA-Z_][a-zA-Z0-9_\.]*)\}`)
-	reBodyParam    = regexp.MustCompile(`(?:body|data|payload|params)\s*[=:]\s*\{([^}]{1,300})\}`)
+	reBodyParam    = regexp.MustCompile(`(?:body|data|json|payload|params|fields)\s*[=:]\s*(?:JSON\.stringify\s*\(\s*)?\{([^}]{1,300})\}`)
 	reBodyParamKey = regexp.MustCompile(`['"]?([a-zA-Z_][a-zA-Z0-9_]*)['"]?\s*:`)
 	// v2: hoisted (dulu di-compile tiap normaliseTemplateURL dipanggil)
 	reConcatTail = regexp.MustCompile(`\s*\+\s*\w+\s*$`)
@@ -273,12 +321,13 @@ func isStaticAsset(rawURL string) bool {
 
 var baseURLDeclarations = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)axios\s*\.defaults\s*\.baseURL\s*=\s*['"](\s*https?://[^'"]{5,120})\s*['"]`),
+	regexp.MustCompile(`(?i)axios\s*\.create\s*\(\s*\{[^}]{0,200}baseURL\s*:\s*['"](\s*https?://[^'"]{5,120})\s*['"]`),
 	regexp.MustCompile(`(?i)base[_]?[Uu][Rr][Ll]\s*[=:]\s*['"](\s*https?://[^'"]{5,120})\s*['"]`),
 	regexp.MustCompile(`(?i)API[_]?BASE(?:[_]?URL)?\s*[=:]\s*['"](\s*https?://[^'"]{5,120})\s*['"]`),
 	regexp.MustCompile(`(?i)api[_]?(?:url|endpoint|host|root|server|origin)\s*[=:]\s*['"](\s*https?://[^'"]{5,120})\s*['"]`),
 	regexp.MustCompile(`(?i)root[_]?[Uu][Rr][Ll]\s*[=:]\s*['"](\s*https?://[^'"]{5,120})\s*['"]`),
 	regexp.MustCompile(`(?i)(?:server|backend|service)[_]?[Uu][Rr][Ll]\s*[=:]\s*['"](\s*https?://[^'"]{5,120})\s*['"]`),
-	regexp.MustCompile(`(?i)(?:VUE_APP|REACT_APP|NEXT_PUBLIC|VITE)[_]API[_]?(?:URL|BASE|ENDPOINT)\s*[=:]\s*['"](\s*https?://[^'"]{5,120})\s*['"]`),
+	regexp.MustCompile(`(?i)(?:VUE_APP|REACT_APP|NEXT_PUBLIC|VITE)(?:_PUBLIC)?[_]?(?:API[_]?BASE[_]?URL|API[_]?URL|API[_]?BASE|API[_]?ENDPOINT|BACKEND[_]?URL)\s*[=:]\s*['"](\s*https?://[^'"]{5,120})\s*['"]`),
 	regexp.MustCompile(`process\.env\.\w+\s*\|\|\s*['"](\s*https?://[^'"]{5,120})\s*['"]`),
 	regexp.MustCompile(`(?i)(?:^|[,\s{(])(?:host|origin|domain|endpoint)\s*[=:]\s*['"](\s*https?://[^'"]{5,120})\s*['"]`),
 }

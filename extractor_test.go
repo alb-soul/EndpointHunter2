@@ -429,3 +429,104 @@ func TestVarMethodBinusShape(t *testing.T) {
 		t.Errorf("method = %s want GET (call-site)", e.Method)
 	}
 }
+func TestInstanceMethodFam(t *testing.T) {
+	eps, base, _ := extractEndpoints(
+		"const api = axios.create({ baseURL: \"https://api.x.example.com\" });\n"+
+			"api.get(\"/users\");\n"+
+			"api.post(\"/orders\");\n",
+		"https://app.x/a.js", "https://app.x/a.js", "", false, true)
+	if base != "https://api.x.example.com" {
+		t.Fatalf("axios.create baseURL not detected: %s", base)
+	}
+	m := epsByURL(eps)
+	for u, meth := range map[string]string{
+		"https://api.x.example.com/users":  "GET",
+		"https://api.x.example.com/orders": "POST",
+	} {
+		e, ok := m[u]
+		if !ok {
+			t.Errorf("missing %s", u)
+			continue
+		}
+		if e.Method != meth {
+			t.Errorf("%s: method=%s want %s", u, e.Method, meth)
+		}
+	}
+}
+
+func TestAxiosRequestFam(t *testing.T) {
+	eps, _, _ := extractEndpoints(
+		"axios.request({ method: \"POST\", url: \"/api/req-route\" });\n"+
+			"axios.request({ url: \"https://api.x.example.com/api/req2\", method: \"GET\" });\n",
+		"https://app.x/a.js", "https://app.x/a.js", "", false, true)
+	m := epsByURL(eps)
+	if e, ok := m["https://app.x/api/req-route"]; !ok || e.Method != "POST" {
+		t.Errorf("axios.request POST wrong: %+v", e)
+	}
+	if e, ok := m["https://api.x.example.com/api/req2"]; !ok || e.Method != "GET" {
+		t.Errorf("axios.request GET wrong: %+v", e)
+	}
+}
+
+func TestAngularHTTPFam(t *testing.T) {
+	eps, _, _ := extractEndpoints(
+		"$http.get(\"/api/ng-get\");\n"+
+			"$http({ method: \"DELETE\", url: \"/api/ng-del\" });\n"+
+			"$http({ url: \"/api/ng-put\", method: \"PUT\" });\n",
+		"https://app.x/a.js", "https://app.x/a.js", "", false, true)
+	m := epsByURL(eps)
+	for u, meth := range map[string]string{
+		"https://app.x/api/ng-get": "GET",
+		"https://app.x/api/ng-del": "DELETE",
+		"https://app.x/api/ng-put": "PUT",
+	} {
+		e, ok := m[u]
+		if !ok {
+			t.Errorf("missing %s", u)
+			continue
+		}
+		if e.Method != meth {
+			t.Errorf("%s: method=%s want %s", u, e.Method, meth)
+		}
+	}
+}
+
+func TestEnvBaseURLPatterns(t *testing.T) {
+	_, base, _ := extractEndpoints(
+		"VITE_API_BASE_URL = \"https://api.vite.example.com\";\nfetch(\"/v1/me\");\n",
+		"https://app.x/a.js", "https://app.x/a.js", "", false, true)
+	if base != "https://api.vite.example.com" {
+		t.Fatalf("VITE_API_BASE_URL not detected: %s", base)
+	}
+	_, base2, _ := extractEndpoints(
+		"REACT_APP_API_BASE_URL = \"https://api.react.example.com\";\nfetch(\"/v1/me\");\n",
+		"https://app.x/a.js", "https://app.x/a.js", "", false, true)
+	if base2 != "https://api.react.example.com" {
+		t.Fatalf("REACT_APP_API_BASE_URL not detected: %s", base2)
+	}
+}
+
+func TestBodyJSONStringifyParams(t *testing.T) {
+	eps, _, _ := extractEndpoints(
+		"fetch(\"/api/update\", { method: \"PUT\", body: JSON.stringify({ email: \"a@b.c\", role: \"admin\" }) });\n",
+		"https://app.x/a.js", "https://app.x/a.js", "", false, true)
+	for _, e := range eps {
+		if e.AbsURL != "https://app.x/api/update" {
+			continue
+		}
+		if !stringIn(e.Params, "email") || !stringIn(e.Params, "role") {
+			t.Errorf("body params missing: %v", e.Params)
+		}
+		return
+	}
+	t.Errorf("endpoint /api/update not extracted")
+}
+
+func stringIn(xs []string, s string) bool {
+	for _, x := range xs {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
