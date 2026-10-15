@@ -525,6 +525,31 @@ func originOf(rawURL string) string {
 
 // ─── URL Resolver ─────────────────────────────────────────────────────────────
 
+// apiShapedEP: relatif beraroma API (selaras sinyal hostHasAPI di detectBaseURL).
+// Dipakai memutuskan apakah leading-/ boleh ikut elected base.
+func apiShapedEP(raw string) bool {
+	l := strings.ToLower(raw)
+	for _, k := range []string{"/api/", "/api?", "/v1", "/v2", "/v3", "/v4",
+		"/graphql", "/rest", "/rpc", "/auth", "/oauth", "/token", "/webhook"} {
+		if strings.Contains(l, k) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasBaseDeclaration: file mendeklarasikan API base eksplisit (axios.create,
+// baseURL=, API_BASE=, ...). Sinyal STRUKTURAL (client menarget base itu) —
+// lebih kuat dari voting statistik; relatif file tsb ikut base deklarasi.
+func hasBaseDeclaration(content string) bool {
+	for _, pat := range baseURLDeclarations {
+		if pat.MatchString(content) {
+			return true
+		}
+	}
+	return false
+}
+
 func resolveURL(raw, jsURL, baseOverride string) string {
 	raw = strings.TrimSpace(raw)
 	raw = normaliseTemplateURL(raw)
@@ -1001,6 +1026,9 @@ func extractEndpoints(content, sourceURL, jsURL, baseOverride string, includeAss
 	if effectiveBase == "" {
 		effectiveBase = detectBaseURL(content, jsURL)
 	}
+	// deklarasi eksplisit (bukan voting): relatif ikut base tsb (TestInstanceMethodFam).
+	// Rule page-origin hanya untuk base hasil voting statistik.
+	fileHasDeclBase := baseOverride != "" || hasBaseDeclaration(content)
 
 	// Atribusi method dari call-site variabel (override label default).
 	varMethods := resolveVarCallMethods(content, collectVarURLs(content))
@@ -1032,7 +1060,16 @@ func extractEndpoints(content, sourceURL, jsURL, baseOverride string, includeAss
 			}
 
 			rawURL = normaliseTemplateURL(rawURL)
-			absURL := resolveURL(rawURL, jsURL, effectiveBase)
+			baseForRaw := effectiveBase
+			if baseOverride == "" && !fileHasDeclBase && strings.HasPrefix(rawURL, "/") && !strings.HasPrefix(rawURL, "//") && !apiShapedEP(rawURL) {
+				// elected base (voter) hanya untuk relatif beraroma API; leading-/
+				// biasa = page-origin (semantik browser). -base eksplisit selalu menang.
+				// TestBaseResolution js2 (/v1/me -> api) tetap lolos via apiShapedEP.
+				if po := originOf(jsURL); po != "" {
+					baseForRaw = po
+				}
+			}
+			absURL := resolveURL(rawURL, jsURL, baseForRaw)
 
 			if !includeAssets && isStaticAsset(absURL) {
 				continue
