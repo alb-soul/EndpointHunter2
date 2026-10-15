@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -40,6 +41,7 @@ type ExtractionPattern struct {
 	URLGroup      int
 	MethodGroup   int
 	DefaultMethod string
+	Validate      func(string) bool
 }
 
 var extractionPatterns = []ExtractionPattern{
@@ -190,6 +192,44 @@ var extractionPatterns = []ExtractionPattern{
 		URLGroup:      1,
 		DefaultMethod: "GET",
 	},
+	{
+		Name:          "location-assign",
+		Regex:         regexp.MustCompile(`(?i)(?:window\.)?location(?:\.href)?\s*=\s*` + bt + `([^` + bte + `\s\\]{2,})` + bt),
+		URLGroup:      1,
+		DefaultMethod: "GET",
+	},
+	{
+		Name:          "href-assign",
+		Regex:         regexp.MustCompile(`\.[Hh][Rr][Ee][Ff]\s*=\s*` + bt + `([^` + bte + `\s\\]{2,})` + bt),
+		URLGroup:      1,
+		DefaultMethod: "GET",
+	},
+	{
+		Name:          "generic-quoted-path",
+		Regex:         regexp.MustCompile(bt + `(\/[^\s` + bte + `\\<>]{2,})` + bt),
+		URLGroup:      1,
+		DefaultMethod: "GET",
+		Validate:      validGenericPathEP,
+	},
+	{
+		Name:          "bare-path-prose",
+		Regex:         regexp.MustCompile(`(?:^|[\s(,;])(\/(?:[A-Za-z0-9_~.\-%]+\/)+[A-Za-z0-9_~.\-%?#\/]*)`), 
+		URLGroup:      1,
+		DefaultMethod: "GET",
+		Validate:      validGenericPathEP,
+	},
+	{
+		Name:          "json-path-key",
+		Regex:         regexp.MustCompile(`"(\/[^"\s\\]{1,120})"\s*:`),
+		URLGroup:      1,
+		DefaultMethod: "GET",
+	},
+	{
+		Name:          "yaml-path-key",
+		Regex:         regexp.MustCompile(`(?m)^[ \t]*(\/[^:\s]{1,120})\s*:`),
+		URLGroup:      1,
+		DefaultMethod: "GET",
+	},
 }
 
 const bt = `['"\x60]`
@@ -205,6 +245,14 @@ var (
 	reBodyParamKey = regexp.MustCompile(`['"]?([a-zA-Z_][a-zA-Z0-9_]*)['"]?\s*:`)
 	// v2: hoisted (dulu di-compile tiap normaliseTemplateURL dipanggil)
 	reConcatTail = regexp.MustCompile(`\s*\+\s*\w+\s*$`)
+	// leaktest-2026-10: pra-ekstraksi untuk bundle obfuscated.
+	reHexEscEP   = regexp.MustCompile(`\\x([0-9a-fA-F]{2})`)
+	reUniEscEP   = regexp.MustCompile(`\\u([0-9a-fA-F]{4})`)
+	reConcatDQEP = regexp.MustCompile(`"([^"\\\n]*)"\s*\+\s*"([^"\\\n]*)"`)
+	reConcatSQEP = regexp.MustCompile(`'([^'\\\n]*)'\s*\+\s*'([^'\\\n]*)'`)
+	reArrJoinEP  = regexp.MustCompile(`\[((?:"[^"\\\n]*"|'[^'\\\n]*')(?:\s*,\s*(?:"[^"\\\n]*"|'[^'\\\n]*'))*)\]\.join\(\s*(?:"/"|'/'|""|'')\s*\)`)
+	reVarAssignEP = regexp.MustCompile(`(?:(?:var|let|const)\s+|,)([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*("([^"\\\n]{2,200})"|'([^'\\\n]{2,200})')`)
+	reQuotedEP = regexp.MustCompile(`"([^"\\\n]*)"|'([^'\\\n]*)'`)
 )
 
 func extractParams(rawURL string, contextLines []string) []string {
@@ -517,6 +565,17 @@ func resolveURL(raw, jsURL, baseOverride string) string {
 
 // ─── Known URL Normalisation ──────────────────────────────────────────────────
 
+// validGenericPathEP: tolak filesystem-path palsu (/usr/bin/...) agar
+// generic-quoted-path tak banjir FP. Sys-prefix = bukan endpoint web.
+func validGenericPathEP(raw string) bool {
+	for _, p := range []string{"/usr/", "/etc/", "/var/", "/opt/", "/bin/", "/sbin/", "/tmp/", "/dev/", "/proc/", "/sys/", "/lib/", "/home/", "/root/", "/mnt/", "/data/"} {
+		if strings.HasPrefix(raw, p) {
+			return false
+		}
+	}
+	return true
+}
+
 func normaliseForFilter(rawURL string) string {
 	u, err := url.Parse(rawURL)
 	if err != nil {
@@ -661,7 +720,279 @@ func resolveVarCallMethods(content string, varURLs map[string]string) map[string
 	return out
 }
 
+// ─── Pra-ekstraksi: normalisasi bundle obfuscated ────────────────────────────
+// Urutan: unescape -> join-concat -> array-join -> propagasi var (loop s.d stabil,
+// maks 3). Semua transformasi preservasi-semantik (single-assignment only) dan
+// preservasi-newline, sehingga nomor baris temuan tetap valid.
+func unescapeEP(s string) string {
+	s = reHexEscEP.ReplaceAllStringFunc(s, func(m string) string {
+		if len(m) < 4 {
+			return m
+		}
+		v, err := strconv.ParseUint(m[2:4], 16, 8)
+		if err != nil {
+			return m
+		}
+		return string(rune(v))
+	})
+	return reUniEscEP.ReplaceAllStringFunc(s, func(m string) string {
+		if len(m) < 6 {
+			return m
+		}
+		v, err := strconv.ParseUint(m[2:6], 16, 16)
+		if err != nil || (v >= 0xD800 && v <= 0xDFFF) {
+			return m
+		}
+		return string(rune(v))
+	})
+}
+
+func joinConcatEP(s string) string {
+	for i := 0; i < 5; i++ {
+		n := reConcatDQEP.ReplaceAllString(s, `"$1$2"`)
+		n = reConcatSQEP.ReplaceAllString(n, `'$1$2'`)
+		if n == s {
+			break
+		}
+		s = n
+	}
+	return s
+}
+
+func evalArrJoinEP(s string) string {
+	return reArrJoinEP.ReplaceAllStringFunc(s, func(m string) string {
+		ji := strings.LastIndex(m, ".join(")
+		if ji < 0 {
+			return m
+		}
+		tail := m[ji+len(".join("):]
+		sep := ""
+		if strings.HasPrefix(tail, `"`) || strings.HasPrefix(tail, `'`) {
+			q := tail[:1]
+			end := strings.Index(tail[1:], q)
+			if end < 0 {
+				return m
+			}
+			sep = tail[1 : 1+end]
+			if sep != "/" && sep != "" {
+				return m
+			}
+		} else {
+			return m
+		}
+		riend := strings.LastIndex(m[:ji], "]")
+		if riend < 0 {
+			return m
+		}
+		inner := m[1:riend]
+		parts := reQuotedEP.FindAllStringSubmatch(inner, -1)
+		if len(parts) == 0 {
+			return m
+		}
+		stripped := reQuotedEP.ReplaceAllString(inner, "")
+		if strings.Trim(stripped, " \t\n\r,") != "" {
+			return m
+		}
+		var elems []string
+		for _, p := range parts {
+			if p[1] != "" {
+				elems = append(elems, p[1])
+			} else {
+				elems = append(elems, p[2])
+			}
+		}
+		return `"` + strings.Join(elems, sep) + `"`
+	})
+}
+
+// propagateEP: one-hop constant propagation.
+// `var/let/const NAME="lit"` atau `,NAME="lit"` (koma-declarator, norma minified)
+// yang TEPAT SATU assignment -> semua use posisi-nilai (+ ${NAME}) di-inline.
+// Guard: shadowing (param/fungsi/loop/import/class), reassignment, shorthand {n},
+// key n:, comparison. Multi-use BOLEH (single-assignment => semua read sama).
+func propagateEP(s string) string {
+	if !(strings.Contains(s, "var ") || strings.Contains(s, "let ") || strings.Contains(s, "const ")) {
+		return s
+	}
+	type decl struct{ name, lit string }
+	var decls []decl
+	for _, loc := range reVarAssignEP.FindAllStringSubmatchIndex(s, -1) {
+		name := s[loc[2]:loc[3]]
+		lit := s[loc[4]:loc[5]]
+		decls = append(decls, decl{name, lit})
+	}
+	if len(decls) == 0 {
+		return s
+	}
+	isWS := func(c byte) bool { return c == ' ' || c == '\t' || c == '\n' || c == '\r' }
+	wordRe := func(name string) *regexp.Regexp {
+		return regexp.MustCompile(`\b` + regexp.QuoteMeta(name) + `\b`)
+	}
+	assignRe := func(name string) *regexp.Regexp {
+		return regexp.MustCompile(`\b` + regexp.QuoteMeta(name) + `\s*=`)
+	}
+	shadowed := func(name string) bool {
+		q := regexp.QuoteMeta(name)
+		pats := []string{
+			`function\s+` + q + `\b`,
+			`function\s*\([^)]*\b` + q + `\b`,
+			`\(\s*[^)]*\b` + q + `\b[^)]*\)\s*=>`,
+			`for\s*\(\s*(?:var|let|const)?\s*` + q + `\b`,
+			`catch\s*\(\s*` + q + `\b`,
+			`class\s+` + q + `\b`,
+			`import\s+[^;]*\b` + q + `\b`,
+		}
+		for _, p := range pats {
+			if regexp.MustCompile(p).MatchString(s) {
+				return true
+			}
+		}
+		return false
+	}
+	cur := s
+	changed := false
+	for _, d := range decls {
+		if shadowed(d.name) {
+			continue
+		}
+		wr := wordRe(d.name)
+		ar := assignRe(d.name)
+		uses := wr.FindAllStringIndex(cur, -1)
+		assignCount := 0
+		for _, u := range uses {
+			tail := cur[u[0]:]
+			if m := ar.FindStringIndex(tail); m != nil && m[0] == 0 {
+				after := tail[m[1]:]
+				if len(after) > 0 && (after[0] == '=' || after[0] == '>') {
+					continue
+				}
+				assignCount++
+			}
+		}
+		if assignCount != 1 {
+			continue
+		}
+		var out strings.Builder
+		prev := 0
+		replaced := false
+		for _, u := range uses {
+			tail := cur[u[0]:]
+			if m := ar.FindStringIndex(tail); m != nil && m[0] == 0 {
+				after := tail[m[1]:]
+				if len(after) == 0 || (after[0] != '=' && after[0] != '>') {
+					continue // deklarasi/assignment — pertahankan
+				}
+			}
+			inTpl := u[0] >= 2 && cur[u[0]-2] == '$' && cur[u[0]-1] == '{'
+			pi := u[0] - 1
+			for pi >= 0 && isWS(cur[pi]) {
+				pi--
+			}
+			ni := u[1]
+			for ni < len(cur) && isWS(cur[ni]) {
+				ni++
+			}
+			atEnd := ni >= len(cur)
+			nextIsKey := !atEnd && (cur[ni] == ':' || cur[ni] == '=' || cur[ni] == '(')
+			okPos := inTpl
+			if !okPos && pi >= 0 && !atEnd {
+				pc := cur[pi]
+				if pc == ':' || pc == '=' || pc == '(' || pc == '[' || pc == '!' || pc == ';' || pc == '?' || pc == '|' || pc == '&' || pc == ',' || pc == '{' {
+					if (pc == ',' || pc == '{') && !inArrCtx(cur, pi) {
+						// shorthand {n} / {a,n} — lewati; [a,n] / f(a,n) lanjut.
+					} else if !nextIsKey {
+						okPos = true
+					}
+				}
+			} else if !okPos && pi >= 0 && atEnd {
+				pc := cur[pi]
+				if pc == ':' || pc == '=' || pc == '(' || pc == '[' || pc == '!' || pc == ';' || pc == '?' || pc == '|' || pc == '&' {
+					okPos = true
+				}
+			}
+			if !okPos {
+				continue
+			}
+			if inTpl && u[1] < len(cur) && cur[u[1]] == '}' {
+				// ${NAME} -> nilai telanjang TANPA braces (agar pola URL absolut
+				// langsung match; braces tak membawa info endpoint pasca-substitusi).
+				rep := d.lit
+				if len(rep) >= 2 && ((rep[0] == '"' && rep[len(rep)-1] == '"') ||
+					(rep[0] == '\'' && rep[len(rep)-1] == '\'')) {
+					rep = rep[1 : len(rep)-1]
+				}
+				out.WriteString(cur[prev:u[0]-2])
+				out.WriteString(rep)
+				prev = u[1] + 1
+				replaced = true
+				continue
+			}
+			out.WriteString(cur[prev:u[0]])
+			rep := d.lit
+			if inTpl {
+				// di dalam ${}: substitusi nilai tanpa quote pembungkus.
+				if len(rep) >= 2 && ((rep[0] == '"' && rep[len(rep)-1] == '"') ||
+					(rep[0] == '\'' && rep[len(rep)-1] == '\'')) {
+					rep = rep[1 : len(rep)-1]
+				}
+			}
+			out.WriteString(rep)
+			prev = u[1]
+			replaced = true
+		}
+		if !replaced {
+			continue
+		}
+		out.WriteString(cur[prev:])
+		cur = out.String()
+		changed = true
+	}
+	if !changed {
+		return s
+	}
+	return cur
+}
+
+// inArrCtx: posisi koma/kurawal dibuka oleh [ atau ( (bukan { object)).
+func inArrCtx(s string, pos int) bool {
+	depth := 0
+	for j := pos; j >= 0 && j > pos-80; j-- {
+		switch s[j] {
+		case '}', ']', ')':
+			depth++
+		case '{':
+			if depth == 0 {
+				return false
+			}
+			depth--
+		case '[', '(':
+			if depth == 0 {
+				return true
+			}
+			depth--
+		}
+	}
+	return false
+}
+
+func normaliseContentEP(s string) string {
+	for i := 0; i < 3; i++ {
+		prev := s
+		s = unescapeEP(s)
+		s = joinConcatEP(s)
+		s = evalArrJoinEP(s)
+		s = propagateEP(s)
+		if s == prev {
+			break
+		}
+	}
+	return s
+}
+
 func extractEndpoints(content, sourceURL, jsURL, baseOverride string, includeAssets, includeExternal bool) ([]Endpoint, string, int) {
+	// leaktest-2026-10: normalisasi dulu (unescape/join/propagate) agar
+	// pola tetap sederhana; nomor baris dari konten ternormalisasi.
+	content = normaliseContentEP(content)
 	var results []Endpoint
 	seen := make(map[string]bool)
 	skippedExternal := map[string]bool{}
@@ -688,6 +1019,9 @@ func extractEndpoints(content, sourceURL, jsURL, baseOverride string, includeAss
 			}
 			rawURL := strings.TrimSpace(content[s:e])
 			if len(rawURL) < 4 {
+				continue
+			}
+			if pat.Validate != nil && !pat.Validate(rawURL) {
 				continue
 			}
 			if strings.Contains(rawURL, " ") {
