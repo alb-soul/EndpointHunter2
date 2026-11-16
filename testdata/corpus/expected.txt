@@ -1,0 +1,53 @@
+# Ground truth corpus.jsonl (dijalankan dgn --scope example.com --include-external -k known.txt)
+# Format: METHOD URL [param1,param2,...]   (param = harus ada di params/body_params jsonl)
+# --- HTML https://app.example.com/ (<base href="/app/">) ---
+GET    https://app.example.com/api/search?q=x&page=2
+POST   https://app.example.com/account/login
+POST   https://app.example.com/app/profile/update
+GET    https://app.example.com/app/account/settings
+GET    https://app.example.com/app/api/inline-relative
+DELETE https://app.example.com/api/inline-root
+# --- JS di CDN (cdn.examplecdn.net) yg dimuat halaman app.example.com ---
+GET    https://app.example.com/api/users
+GET    https://app.example.com/api/a
+POST   https://app.example.com/api/b secret,token
+GET    https://app.example.com/api/orders/{e}/items
+GET    https://app.example.com/api/v1/user/{t}/profile
+GET    https://app.example.com/api/tpl/{id}/y
+GET    https://app.example.com/api/tpl2/{n}/z
+GET    https://app.example.com/api/unicode-esc
+POST   https://app.example.com/api/login username,password
+GET    https://app.example.com/api/list page,size
+POST   https://app.example.com/api/legacy a,b
+PUT    https://app.example.com/api/req-obj
+PATCH  https://app.example.com/api/nested
+GET    https://app.example.com/api/nuxt-get
+GET    https://app.example.com/dashboard/:tab
+GET    https://app.example.com/reports/:id/view
+POST   https://app.example.com/graphql
+GET    wss://rt.example.com/socket/v2
+GET    https://app.example.com/v1/items:batchGet
+GET    https://app.example.com/api/dot-relative
+GET    https://app.example.com/api/dotdot
+GET    https://app.example.com/api/assets.list
+# --- Vite same-origin + axios.create baseURL ber-path ---
+GET    https://api.example.com/api/v2/users/me
+POST   https://api.example.com/api/v2/orders sku,qty
+GET    https://app.example.com/admin/settings
+GET    https://api.example.com/v2/explicit?x=1
+# --- bundle campur SDK eksternal (baseURL pihak ketiga tak boleh membajak) ---
+GET    https://app.example.com/api/own-endpoint
+POST   https://app.example.com/api/own-two
+# --- config.json (slash di-escape gaya PHP) ---
+GET    https://api.example.com/v1/auth/login
+GET    https://api.example.com/api/v1/me
+# --- Next.js _buildManifest ---
+GET    https://app.example.com/account/{id}
+GET    https://app.example.com/blog/{slug}
+GET    https://app.example.com/api/proxy/:path*
+GET    https://backend.example.com/:path*
+# --- Angular ---
+GET    https://admin.example.com/admin/users/:id
+GET    https://admin.example.com/billing
+POST   https://admin.example.com/api/ng/save name
+GET    https://admin.example.com/api/ng/items

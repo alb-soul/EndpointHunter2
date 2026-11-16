@@ -1,0 +1,2 @@
+https://APP.example.com:443/api/jsonp-data/
+http://app.example.com/api/collect
