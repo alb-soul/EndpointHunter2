@@ -12,7 +12,9 @@ const fuzzValue = "FUZZ"
 
 var (
 	reEnrichBrace = regexp.MustCompile(`\{[^}]*\}`)
-	reEnrichColon = regexp.MustCompile(`:([A-Za-z_]\w*)[+*]?`)
+	// path param Express-style hanya sebagai segmen utuh (/:id, /:path*).
+	// Dulu `:([A-Za-z_]\w*)` di mana saja -> /v1/items:batchGet jadi /v1/itemsFUZZ.
+	reEnrichColon = regexp.MustCompile(`/:([A-Za-z_]\w*)[+*?]?`)
 	reEnrichWord  = regexp.MustCompile(`[^A-Za-z0-9_]+`)
 )
 
@@ -69,7 +71,7 @@ func enrichEndpoint(ep Endpoint) Enriched {
 	}
 
 	// fuzz path placeholders ({id} then :id)
-	u.Path = reEnrichColon.ReplaceAllString(reEnrichBrace.ReplaceAllString(u.Path, fuzzValue), fuzzValue)
+	u.Path = reEnrichColon.ReplaceAllString(reEnrichBrace.ReplaceAllString(u.Path, fuzzValue), "/"+fuzzValue)
 	u.RawPath = "" // force String() to re-encode from the new Path
 
 	// rebuild query, order-preserving
@@ -98,13 +100,19 @@ func enrichEndpoint(ep Endpoint) Enriched {
 		}
 	}
 
+	// kunci yang pasti query (axios params:, $.get GET) tetap di query walau
+	// method-nya POST; sisanya ke body untuk method ber-body.
+	forceQuery := map[string]bool{}
+	for _, p := range ep.QueryParams {
+		forceQuery[p] = true
+	}
 	var body []string
 	for _, p := range ep.Params {
 		p = strings.TrimSpace(p)
 		if p == "" || covered[p] || qkeys[p] {
 			continue
 		}
-		if bodyMethod {
+		if bodyMethod && !forceQuery[p] {
 			body = append(body, p)
 		} else {
 			pairs = append(pairs, [2]string{p, fuzzValue})

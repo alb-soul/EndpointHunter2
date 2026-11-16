@@ -1,24 +1,25 @@
 package main
 
 // ============================================================
-// endpoint-hunter2 — main.go (patched)
+// endpoint-hunter2 — main.go
 //
-// Build (dir terpisah, package: main.go + extractor.go + enrich.go + go.mod):
+// Build (dir terpisah, package: *.go + go.mod):
 //   go build -o endpoint-hunter2 .
 //
-// PERUBAHAN vs v1:
-//   * --httpx-json <file> : baca {url, body} dari httpx -json -irr dan ekstrak
-//     endpoint dari body TANPA fetch ulang (body-reuse). URL asli tetap dipakai
-//     sebagai base → resolusi path relatif & source akurat. Streaming.
-//   * Shared HTTP transport (keep-alive per-host).
-//   * FlareSolverr re-solve saat 403/429 (cookie expired) di fetchContent.
-//   * (extractor.go) regex hoist + whole-content scan + window konteks char.
+//   * --httpx-json <file|-> : body-reuse dari `httpx -json -irr` (streaming,
+//     baris raksasa tidak menghentikan pembacaan; body dipotong 10MB).
+//   * Fetch mode: header -H / -ua dikirim di SEMUA request (termasuk redirect),
+//     Cookie dari beberapa -H digabung, -H "Host: x" diterapkan ke req.Host.
+//   * Hasil digabung deterministik (urutan input), endpoint relatif dari JS di
+//     CDN ditempel ke origin halaman yang memuat JS (<script src>).
+//   * Exit code: 0 sukses, 1 error input/output, 130 diinterupsi.
 // ============================================================
 
 import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -37,10 +38,14 @@ import (
 )
 
 const (
-	version   = "2.0.1"
+	version   = "2.1.0"
 	defaultUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 	maxBodyMB = 10
-	banner    = `
+	// batas satu baris JSONL httpx (-irr memuat body + raw response, ter-escape;
+	// body 10MB bisa jadi >60MB). Baris di atas ini dilewati (dihitung), bukan
+	// menghentikan seluruh pembacaan seperti bufio.Scanner dulu.
+	maxJSONLLine = 256 << 20
+	banner       = `
   _____           _             _       _   _   _             _
  | ____|_ __   __| |_ __   ___ (_)_ __ | |_| | | |_   _ _ __ | |_ ___ _ __
  |  _| | '_ \ / _` + "`" + ` | '_ \ / _ \| | '_ \| __| |_| | | | | '_ \| __/ _ \ '__|
@@ -79,11 +84,12 @@ type Config struct {
 	Scope           string
 	ScopeExact      exactScopeValue // --scope-exact: bare=modifier, =Ddomain=tepat D
 	BaseScope       bool            // -bs/--base-scope: scope otomatis dari registrable domain input
-	HTTPXJSON       string          // v2: JSONL dari httpx -json -irr
+	HTTPXJSON       string          // JSONL dari httpx -json -irr
 	Threads         int
 	DelayMs         int
 	RatePerSec      float64
 	UserAgent       string
+	UAExplicit      bool // -ua diberikan eksplisit -> menang atas UA FlareSolverr
 	FlareSolvrURL   string
 	OutputFile      string
 	OutPrefix       string
@@ -101,6 +107,43 @@ type Config struct {
 	IncludeExternal bool
 	ExtraHeaders    []string
 	MaxBodyBytes    int64
+
+	headers   []hdrKV // -H ter-parse (tanpa Cookie/Host)
+	hdrCookie string  // gabungan semua -H Cookie
+	hdrHost   string  // -H Host
+	hdrUA     string  // -H User-Agent (menang atas -ua)
+}
+
+type hdrKV struct{ name, value string }
+
+// parseHeaders: validasi -H "Name: value". Cookie dari beberapa -H digabung
+// (dulu Header.Set -> -H Cookie terakhir menimpa cookie identitas/FlareSolverr).
+func parseHeaders(cfg *Config) []string {
+	var bad []string
+	var cookies []string
+	for _, h := range cfg.ExtraHeaders {
+		parts := strings.SplitN(h, ":", 2)
+		name := strings.TrimSpace(parts[0])
+		if len(parts) != 2 || name == "" || strings.ContainsAny(name, " \t\r\n") {
+			bad = append(bad, h)
+			continue
+		}
+		val := strings.TrimSpace(parts[1])
+		switch strings.ToLower(name) {
+		case "cookie":
+			if val != "" {
+				cookies = append(cookies, val)
+			}
+		case "host":
+			cfg.hdrHost = val
+		case "user-agent":
+			cfg.hdrUA = val
+		default:
+			cfg.headers = append(cfg.headers, hdrKV{name, val})
+		}
+	}
+	cfg.hdrCookie = strings.Join(cookies, "; ")
+	return bad
 }
 
 // ─── FlareSolverr ─────────────────────────────────────────────────────────────
@@ -146,7 +189,7 @@ func newFSCache() *FSCache {
 	}
 }
 
-func (fc *FSCache) Resolve(cfg *Config, domain string) *FSSession {
+func (fc *FSCache) Resolve(cfg *Config, scheme, domain string) *FSSession {
 	fc.mu.RLock()
 	if s, ok := fc.sessions[domain]; ok {
 		fc.mu.RUnlock()
@@ -162,7 +205,7 @@ func (fc *FSCache) Resolve(cfg *Config, domain string) *FSSession {
 	fc.mu.Unlock()
 
 	once.Do(func() {
-		sess := solveDomain(cfg, domain)
+		sess := solveDomain(cfg, scheme, domain)
 		fc.mu.Lock()
 		fc.sessions[domain] = sess
 		fc.mu.Unlock()
@@ -174,7 +217,7 @@ func (fc *FSCache) Resolve(cfg *Config, domain string) *FSSession {
 	return s
 }
 
-// Invalidate menghapus sesi domain agar Resolve berikutnya solve ulang (v2).
+// Invalidate menghapus sesi domain agar Resolve berikutnya solve ulang.
 func (fc *FSCache) Invalidate(domain string) {
 	fc.mu.Lock()
 	delete(fc.sessions, domain)
@@ -183,8 +226,7 @@ func (fc *FSCache) Invalidate(domain string) {
 }
 
 // fsClient: client khusus FlareSolverr dengan timeout lebih panjang (solve bisa
-// 40-60s) dan transport sendiri, TIDAK bergantung pada httpClient yang Timeout-nya
-// mengikuti --timeout (default 7s) — http.Post bawaan (tanpa timeout) ditinggalkan.
+// 40-60s), tidak bergantung pada --timeout.
 var fsClient = &http.Client{
 	Timeout: 90 * time.Second,
 	Transport: &http.Transport{
@@ -196,37 +238,27 @@ var fsClient = &http.Client{
 	},
 }
 
-func solveDomain(cfg *Config, domain string) *FSSession {
-	targetURL := "https://" + domain
-
-	body, _ := json.Marshal(fsRequest{
-		Cmd:        "request.get",
-		URL:        targetURL,
-		MaxTimeout: 60000,
-	})
-
+func solveDomain(cfg *Config, scheme, domain string) *FSSession {
+	if scheme != "http" {
+		scheme = "https"
+	}
+	body, _ := json.Marshal(fsRequest{Cmd: "request.get", URL: scheme + "://" + domain, MaxTimeout: 60000})
 	resp, err := fsClient.Post(strings.TrimRight(cfg.FlareSolvrURL, "/")+"/v1", "application/json", bytes.NewReader(body))
 	if err != nil {
+		logVerbose(cfg, "FlareSolverr %s: %v", domain, err)
 		return nil
 	}
 	defer resp.Body.Close()
-
 	var fsResp fsResponse
-	if err := json.NewDecoder(resp.Body).Decode(&fsResp); err != nil {
+	if err := json.NewDecoder(resp.Body).Decode(&fsResp); err != nil || fsResp.Status != "ok" {
+		logVerbose(cfg, "FlareSolverr %s: status=%q err=%v", domain, fsResp.Status, err)
 		return nil
 	}
-	if fsResp.Status != "ok" {
-		return nil
-	}
-
 	var cookieParts []string
 	for _, c := range fsResp.Solution.Cookies {
 		cookieParts = append(cookieParts, c.Name+"="+c.Value)
 	}
-	return &FSSession{
-		Cookies:   strings.Join(cookieParts, "; "),
-		UserAgent: fsResp.Solution.UserAgent,
-	}
+	return &FSSession{Cookies: strings.Join(cookieParts, "; "), UserAgent: fsResp.Solution.UserAgent}
 }
 
 // ─── HTTP Fetcher ─────────────────────────────────────────────────────────────
@@ -241,6 +273,8 @@ func buildClient(cfg *Config) *http.Client {
 	}
 	return &http.Client{
 		Timeout: time.Duration(cfg.Timeout) * time.Second,
+		// Go meneruskan header request awal (UA, -H identitas) ke setiap hop
+		// redirect; Cookie/Authorization dibuang bila pindah domain (aman).
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 5 {
 				return fmt.Errorf("too many redirects")
@@ -259,69 +293,87 @@ func buildClient(cfg *Config) *http.Client {
 	}
 }
 
-func fetchContent(cfg *Config, rawURL string) (string, error) {
-	u, _ := url.Parse(rawURL)
-	host := ""
-	if u != nil {
-		host = u.Host
+// buildRequest: request GET dgn header identitas lengkap.
+func buildRequest(cfg *Config, rawURL string, sess *FSSession) (*http.Request, error) {
+	req, err := http.NewRequest("GET", rawURL, nil)
+	if err != nil {
+		return nil, err
 	}
+	ua := cfg.UserAgent
+	if sess != nil && sess.UserAgent != "" && !cfg.UAExplicit {
+		ua = sess.UserAgent // cf_clearance terikat UA solver
+	}
+	if cfg.hdrUA != "" {
+		ua = cfg.hdrUA
+	}
+	req.Header.Set("User-Agent", ua)
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	var cookies []string
+	if sess != nil && sess.Cookies != "" {
+		cookies = append(cookies, sess.Cookies)
+	}
+	if cfg.hdrCookie != "" {
+		cookies = append(cookies, cfg.hdrCookie)
+	}
+	if len(cookies) > 0 {
+		req.Header.Set("Cookie", strings.Join(cookies, "; "))
+	}
+	for _, h := range cfg.headers {
+		req.Header.Set(h.name, h.value)
+	}
+	if cfg.hdrHost != "" {
+		req.Host = cfg.hdrHost
+	}
+	return req, nil
+}
 
+type fetched struct {
+	body, finalURL, contentType string
+}
+
+func fetchContent(cfg *Config, rawURL string) (fetched, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		return fetched{}, fmt.Errorf("invalid URL")
+	}
 	for attempt := 0; attempt < 2; attempt++ {
-		ua := cfg.UserAgent
-		var cookies string
-		if cfg.FlareSolvrURL != "" && host != "" {
-			if sess := fsCache.Resolve(cfg, host); sess != nil {
-				if sess.UserAgent != "" {
-					ua = sess.UserAgent
-				}
-				cookies = sess.Cookies
-			}
+		var sess *FSSession
+		if cfg.FlareSolvrURL != "" {
+			sess = fsCache.Resolve(cfg, u.Scheme, u.Host)
 		}
-
-		req, err := http.NewRequest("GET", rawURL, nil)
+		req, err := buildRequest(cfg, rawURL, sess)
 		if err != nil {
-			return "", err
+			return fetched{}, err
 		}
-		req.Header.Set("User-Agent", ua)
-		req.Header.Set("Accept", "*/*")
-		req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-		if cookies != "" {
-			req.Header.Set("Cookie", cookies)
-		}
-		for _, h := range cfg.ExtraHeaders {
-			parts := strings.SplitN(h, ":", 2)
-			if len(parts) == 2 {
-				req.Header.Set(strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]))
-			}
-		}
-
 		resp, err := httpClient.Do(req)
 		if err != nil {
-			return "", err
+			return fetched{}, err
 		}
-
 		if resp.StatusCode == 403 || resp.StatusCode == 429 {
 			resp.Body.Close()
-			if cfg.FlareSolvrURL != "" && host != "" && attempt == 0 {
-				fsCache.Invalidate(host)
+			if cfg.FlareSolvrURL != "" && attempt == 0 {
+				fsCache.Invalidate(u.Host)
 				continue
 			}
-			return "", fmt.Errorf("HTTP %d", resp.StatusCode)
+			return fetched{}, fmt.Errorf("HTTP %d", resp.StatusCode)
 		}
 		if resp.StatusCode < 200 || resp.StatusCode >= 400 {
 			resp.Body.Close()
-			return "", fmt.Errorf("HTTP %d", resp.StatusCode)
+			return fetched{}, fmt.Errorf("HTTP %d", resp.StatusCode)
 		}
-
-		limited := io.LimitReader(resp.Body, cfg.MaxBodyBytes)
-		data, err := io.ReadAll(limited)
+		data, err := io.ReadAll(io.LimitReader(resp.Body, cfg.MaxBodyBytes))
 		resp.Body.Close()
 		if err != nil {
-			return "", err
+			return fetched{}, err
 		}
-		return string(data), nil
+		f := fetched{body: string(data), finalURL: rawURL, contentType: resp.Header.Get("Content-Type")}
+		if resp.Request != nil && resp.Request.URL != nil {
+			f.finalURL = resp.Request.URL.String()
+		}
+		return f, nil
 	}
-	return "", fmt.Errorf("blocked after retry")
+	return fetched{}, fmt.Errorf("blocked after retry")
 }
 
 // ─── Output ───────────────────────────────────────────────────────────────────
@@ -341,10 +393,10 @@ func colorInterest(cfg *Config, interest string) string {
 }
 
 func colorMethod(cfg *Config, method string) string {
-	if cfg.NoColor {
-		return fmt.Sprintf("%-7s", method)
-	}
 	m := fmt.Sprintf("%-7s", method)
+	if cfg.NoColor {
+		return m
+	}
 	switch method {
 	case "GET":
 		return cGreen + m + cReset
@@ -364,8 +416,6 @@ func printEndpoint(cfg *Config, ep Endpoint) string {
 	if len(ep.Params) > 0 {
 		params = fmt.Sprintf("  params=[%s]", strings.Join(ep.Params, ","))
 	}
-	interest := colorInterest(cfg, ep.Interest)
-	method := colorMethod(cfg, ep.Method)
 	epURL := ep.AbsURL
 	if !cfg.NoColor {
 		epURL = cWhite + epURL + cReset
@@ -378,7 +428,7 @@ func printEndpoint(cfg *Config, ep Endpoint) string {
 			src = fmt.Sprintf("  %s← %s%s", cDim, ep.Source, cReset)
 		}
 	}
-	return fmt.Sprintf("[%s] %s %s%s%s", interest, method, epURL, params, src)
+	return fmt.Sprintf("[%s] %s %s%s%s", colorInterest(cfg, ep.Interest), colorMethod(cfg, ep.Method), epURL, params, src)
 }
 
 // ─── Known URL Filter ─────────────────────────────────────────────────────────
@@ -389,21 +439,24 @@ type KnownSet struct {
 }
 
 func newKnownSet() *KnownSet {
-	return &KnownSet{
-		paths: make(map[string]bool),
-		full:  make(map[string]bool),
-	}
+	return &KnownSet{paths: make(map[string]bool), full: make(map[string]bool)}
 }
 
 func (ks *KnownSet) Add(rawURL string) {
 	rawURL = strings.TrimSpace(rawURL)
-	if rawURL == "" {
+	if f := strings.Fields(rawURL); len(f) > 0 {
+		rawURL = f[0] // "url [200] [title]" -> url
+	}
+	if rawURL == "" || strings.HasPrefix(rawURL, "#") {
 		return
 	}
 	ks.full[dedupKey(rawURL)] = true
 	ks.paths[normaliseForFilter(rawURL)] = true
 }
 
+// Contains: cocok penuh, atau host(+port non-default)+path sama (skema,
+// query, trailing slash, port default diabaikan — normalisasi yang sama
+// dipakai saat Add).
 func (ks *KnownSet) Contains(rawURL string) bool {
 	if ks.full[dedupKey(rawURL)] {
 		return true
@@ -411,40 +464,29 @@ func (ks *KnownSet) Contains(rawURL string) bool {
 	return ks.paths[normaliseForFilter(rawURL)]
 }
 
-func (ks *KnownSet) Size() int {
-	return len(ks.full)
-}
+func (ks *KnownSet) Size() int { return len(ks.full) }
 
 // ─── Rate Limiter ─────────────────────────────────────────────────────────────
 
-type RateLimiter struct {
-	ticker *time.Ticker
-	done   chan struct{}
-}
+type RateLimiter struct{ ticker *time.Ticker }
 
 func newRateLimiter(rps float64) *RateLimiter {
 	if rps <= 0 {
 		return nil
 	}
-	interval := time.Duration(float64(time.Second) / rps)
-	return &RateLimiter{
-		ticker: time.NewTicker(interval),
-		done:   make(chan struct{}),
-	}
+	return &RateLimiter{ticker: time.NewTicker(time.Duration(float64(time.Second) / rps))}
 }
 
 func (r *RateLimiter) Wait() {
-	if r == nil {
-		return
+	if r != nil {
+		<-r.ticker.C
 	}
-	<-r.ticker.C
 }
 
 func (r *RateLimiter) Stop() {
-	if r == nil {
-		return
+	if r != nil {
+		r.ticker.Stop()
 	}
-	r.ticker.Stop()
 }
 
 // ─── Logging ──────────────────────────────────────────────────────────────────
@@ -467,6 +509,11 @@ func logWarn(cfg *Config, format string, args ...interface{}) {
 	}
 }
 
+// logErr: error yang memengaruhi hasil — tetap tampil walau -silent.
+func logErr(format string, args ...interface{}) {
+	fmt.Fprintf(os.Stderr, "[endpoint-hunter2] "+format+"\n", args...)
+}
+
 // ─── Result ───────────────────────────────────────────────────────────────────
 
 type Result struct {
@@ -481,61 +528,204 @@ type Result struct {
 // ─── Worker ───────────────────────────────────────────────────────────────────
 
 type WorkItem struct {
-	URL     string
-	IsLocal bool
-	Content string
+	URL         string
+	PageURL     string // final_url httpx (bila ada) — dasar resolusi
+	IsLocal     bool
+	Content     string
+	ContentType string
+	seq         int
 }
 
-// httpxRecord: baris JSONL httpx -json -irr
+// httpxRecord: baris JSONL httpx -json -irr (field lain diabaikan).
 type httpxRecord struct {
-	URL        string `json:"url"`
-	StatusCode int    `json:"status_code"`
-	Body       string `json:"body"`
+	URL         string `json:"url"`
+	FinalURL    string `json:"final_url"`
+	StatusCode  int    `json:"status_code"`
+	Body        string `json:"body"`
+	ContentType string `json:"content_type"`
 }
 
-func processURL(cfg *Config, item WorkItem, known *KnownSet, baseURL string) []Endpoint {
-	var content string
-	var err error
-	sourceURL := item.URL
+// recResult: hasil satu record. eps sudah lolos filter; pending = relatif-origin
+// dari JS (filter ditunda sampai atribusi ulang CDN -> origin halaman).
+type recResult struct {
+	seq       int
+	eps       []Endpoint
+	pending   []Endpoint
+	refs      []string
+	docOrigin string
+	skipped   int
+}
 
-	if item.IsLocal {
-		content = item.Content
-		if sourceURL == "" {
-			sourceURL = "local-file"
+var binaryCTPrefixes = []string{"image/", "audio/", "video/", "font/", "application/octet-stream",
+	"application/pdf", "application/zip", "application/x-protobuf", "application/wasm", "application/x-font"}
+
+func isBinaryContent(ct, body string) bool {
+	ct = strings.ToLower(ct)
+	for _, p := range binaryCTPrefixes {
+		if strings.HasPrefix(ct, p) {
+			return !strings.HasPrefix(ct, "image/svg") // SVG = teks (bisa memuat URL)
 		}
-	} else {
+	}
+	head := body
+	if len(head) > 4096 {
+		head = head[:4096]
+	}
+	return strings.IndexByte(head, 0) >= 0
+}
+
+func scopeChecker(cfg *Config, scopeSrc string) func(string) bool {
+	if cfg.Scope == "" && !cfg.ScopeExact.set && !(cfg.BaseScope && scopeSrc != "") {
+		return nil
+	}
+	return func(h string) bool { return passScopeFilter(cfg, "https://"+h+"/", scopeSrc) }
+}
+
+func processItem(cfg *Config, item WorkItem, known *KnownSet) recResult {
+	res := recResult{seq: item.seq}
+	content, pageURL, ctype := item.Content, item.PageURL, item.ContentType
+	if pageURL == "" {
+		pageURL = item.URL
+	}
+	label := item.URL
+	if !item.IsLocal {
 		logVerbose(cfg, "Fetching: %s", item.URL)
-		content, err = fetchContent(cfg, item.URL)
+		f, err := fetchContent(cfg, item.URL)
 		if err != nil {
 			logVerbose(cfg, "Error fetching %s: %v", item.URL, err)
-			return nil
+			return res
 		}
+		content, pageURL, ctype = f.body, f.finalURL, f.contentType
+	} else if label == "" {
+		label = "local-file"
 	}
-
-	raw, detectedBase, skippedExt := extractEndpoints(content, sourceURL, item.URL, baseURL, cfg.IncludeAssets, cfg.IncludeExternal)
-	logVerbose(cfg, "  Base URL: %s", detectedBase)
-	if skippedExt > 0 {
-		logInfo(cfg, "%s[i]%s %d absolute URL(s) skipped as external (base %s) -- re-run with --include-external (or --scope <domain>) to include", cDim, cReset, skippedExt, detectedBase)
+	if content == "" || isBinaryContent(ctype, content) {
+		return res
 	}
-
 	scopeSrc := ""
 	if cfg.BaseScope {
-		scopeSrc = scopeHostForItem(cfg, item)
+		scopeSrc = scopeHostForItem(cfg, WorkItem{URL: pageURL})
 	}
-	var results []Endpoint
-	for _, ep := range raw {
-		if ep.AbsURL == "" || ep.AbsURL == item.URL {
+	r := Extract(content, ExtractOptions{
+		SourceLabel:     label,
+		PageURL:         pageURL,
+		BaseOverride:    cfg.BaseURL,
+		ContentType:     ctype,
+		IncludeAssets:   cfg.IncludeAssets,
+		IncludeExternal: cfg.IncludeExternal,
+		InScope:         scopeChecker(cfg, scopeSrc),
+	})
+	logVerbose(cfg, "  %s base=%s endpoints=%d", label, r.Base, len(r.Endpoints))
+	res.skipped = r.SkippedExternal
+	res.refs, res.docOrigin = r.ScriptRefs, r.DocOrigin
+	for _, ep := range r.Endpoints {
+		ep.seq = item.seq
+		if ep.PageRel && cfg.BaseURL == "" {
+			res.pending = append(res.pending, ep)
 			continue
 		}
-		if !passScopeFilter(cfg, ep.AbsURL, scopeSrc) {
-			continue
+		if keepEndpoint(cfg, ep, known, item.URL) {
+			res.eps = append(res.eps, ep)
 		}
-		if known.Contains(ep.AbsURL) {
-			continue
-		}
-		results = append(results, ep)
 	}
-	return results
+	return res
+}
+
+// keepEndpoint: filter akhir (self, aset, scope, known).
+func keepEndpoint(cfg *Config, ep Endpoint, known *KnownSet, srcURL string) bool {
+	if ep.AbsURL == "" || ep.AbsURL == srcURL || ep.AbsURL == ep.PageURL {
+		return false
+	}
+	if !cfg.IncludeAssets && strings.Contains(ep.AbsURL, "://") && isStaticAsset(ep.AbsURL) {
+		return false
+	}
+	scopeSrc := ""
+	if cfg.BaseScope {
+		scopeSrc = scopeHostForItem(cfg, WorkItem{URL: ep.PageURL})
+	}
+	if !passScopeFilter(cfg, ep.AbsURL, scopeSrc) {
+		return false
+	}
+	return !known.Contains(ep.AbsURL)
+}
+
+// scriptKey: identitas file JS (skema+host lowercase + path; query diabaikan).
+func scriptKey(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	return strings.ToLower(u.Scheme) + "://" + hostKey(u) + u.EscapedPath()
+}
+
+// reattribute: endpoint relatif-origin dari JS ditempel ke origin halaman yang
+// memuat JS tsb (<script src> di record HTML). JS di CDN (cdn.vendor.net/app.js
+// dimuat app.target.com) -> fetch("/api/x") = app.target.com/api/x, bukan CDN.
+// JS yang tak direferensikan halaman mana pun: tetap origin file-nya.
+func reattribute(pending []Endpoint, refs map[string]map[string]bool) []Endpoint {
+	var out []Endpoint
+	for _, ep := range pending {
+		origins := refs[scriptKey(ep.PageURL)]
+		if len(origins) == 0 {
+			out = append(out, ep)
+			continue
+		}
+		list := make([]string, 0, len(origins))
+		for o := range origins {
+			list = append(list, o)
+		}
+		sort.Strings(list)
+		if len(list) > 5 {
+			list = list[:5]
+		}
+		for _, o := range list {
+			c := ep
+			c.AbsURL = resolveAgainst(o, ep.RelPath)
+			c.Interest = scoreInterest(c.AbsURL)
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// readJSONLines: baca per-baris tanpa batas keras bufio.Scanner. Baris >max
+// dilewati (dihitung) dan pembacaan berlanjut. fn=false -> berhenti.
+func readJSONLines(r io.Reader, max int, fn func([]byte) bool) (skipped int, err error) {
+	br := bufio.NewReaderSize(r, 1<<20)
+	var buf []byte
+	tooLong := false
+	for {
+		chunk, rerr := br.ReadSlice('\n')
+		if len(chunk) > 0 && !tooLong {
+			if len(buf)+len(chunk) > max {
+				tooLong = true
+				buf = nil
+			} else {
+				buf = append(buf, chunk...)
+			}
+		}
+		if rerr == bufio.ErrBufferFull {
+			continue
+		}
+		if tooLong {
+			skipped++
+		} else if line := bytes.TrimSpace(buf); len(line) > 0 {
+			if !fn(line) {
+				return skipped, nil
+			}
+		}
+		tooLong = false
+		if cap(buf) > 64<<20 {
+			buf = nil // jangan tahan buffer raksasa
+		} else {
+			buf = buf[:0]
+		}
+		if rerr == io.EOF {
+			return skipped, nil
+		}
+		if rerr != nil {
+			return skipped, rerr
+		}
+	}
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
@@ -550,7 +740,7 @@ var boolFlags = map[string]bool{
 	"json": true, "silent": true, "v": true, "verbose": true,
 	"no-color": true, "no-source": true, "urls-only": true,
 	"fuzz": true, "curl": true, "include-assets": true, "include-external": true,
-	"bs": true, "base-scope": true, "scope-exact": true,
+	"bs": true, "base-scope": true, "scope-exact": true, "version": true,
 }
 
 var valueFlags = map[string]bool{
@@ -562,11 +752,8 @@ var valueFlags = map[string]bool{
 }
 
 // reorderArgsForParsing memindahkan flag dikenal ke depan agar flag TETAP
-// terbaca walau ditulis setelah URL posisional.
-// BUGFIX: Go flag berhenti parse di argumen posisional pertama —
-// `endpoint-hunter2 <url> -o out` membuat "-o out" dianggap URL target
-// (file tidak tertulis, URL sampah ikut di-fetch).
-// Token dash yang tidak dikenal dibiarkan apa adanya (tidak diutak-atik).
+// terbaca walau ditulis setelah URL posisional (Go flag berhenti di argumen
+// posisional pertama). Token dash yang tidak dikenal dibiarkan apa adanya.
 func reorderArgsForParsing(args []string) []string {
 	var flags, positional []string
 	i := 0
@@ -579,10 +766,7 @@ func reorderArgsForParsing(args []string) []string {
 		name := ""
 		isFlag := len(a) > 1 && a[0] == '-' && a != "-"
 		if isFlag {
-			name = a[1:]
-			if strings.HasPrefix(name, "-") {
-				name = name[1:]
-			}
+			name = strings.TrimPrefix(a[1:], "-")
 			if idx := strings.Index(name, "="); idx >= 0 {
 				name = name[:idx]
 			}
@@ -591,7 +775,6 @@ func reorderArgsForParsing(args []string) []string {
 			if name == "scope-exact" && !strings.Contains(a, "=") && i+1 < len(args) {
 				// `--scope-exact api.x` (spasi): makan token berikut sbg domain,
 				// KECUALI bila ia jelas URL target (ada :// atau /) atau flag.
-				// Bentuk `=` (`--scope-exact=api.x`) selalu aman & disarankan.
 				nxt := args[i+1]
 				if nxt != "" && !strings.HasPrefix(nxt, "-") && !strings.Contains(nxt, "://") && !strings.Contains(nxt, "/") {
 					i++
@@ -601,14 +784,12 @@ func reorderArgsForParsing(args []string) []string {
 				}
 			} else {
 				flags = append(flags, a)
-				if valueFlags[name] && !strings.Contains(a, "=") {
-					if i+1 < len(args) {
-						i++
-						flags = append(flags, args[i])
-					}
+				if valueFlags[name] && !strings.Contains(a, "=") && i+1 < len(args) {
+					i++
+					flags = append(flags, args[i])
 				}
 			}
-		} else if isFlag && len(a) > 2 && a[0] == '-' && a[1] != '-' && valueFlags[a[1:2]] {
+		} else if isFlag && len(a) > 2 && a[1] != '-' && valueFlags[a[1:2]] {
 			// bentuk nempel: -oout.txt -> -o out.txt
 			flags = append(flags, a[:2], a[2:])
 		} else {
@@ -619,16 +800,50 @@ func reorderArgsForParsing(args []string) []string {
 	return append(flags, positional...)
 }
 
-func main() {
+// normScopeArg: "https://*.Example.com:443/x" -> "example.com".
+func normScopeArg(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if i := strings.Index(s, "://"); i >= 0 {
+		s = s[i+3:]
+	}
+	if i := strings.IndexAny(s, "/?#"); i >= 0 {
+		s = s[:i]
+	}
+	if i := strings.LastIndex(s, "@"); i >= 0 {
+		s = s[i+1:]
+	}
+	if i := strings.LastIndex(s, ":"); i >= 0 && !strings.Contains(s, "]") {
+		if _, err := strconv.Atoi(s[i+1:]); err == nil {
+			s = s[:i]
+		}
+	}
+	return strings.TrimSuffix(strings.TrimPrefix(s, "*."), ".")
+}
+
+func readURLList(r io.Reader, into *[]string) error {
+	_, err := readJSONLines(r, 1<<20, func(b []byte) bool {
+		line := strings.TrimSpace(string(b))
+		if line != "" && !strings.HasPrefix(line, "#") {
+			*into = append(*into, line)
+		}
+		return true
+	})
+	return err
+}
+
+func main() { os.Exit(run()) }
+
+func run() int {
 	cfg := &Config{}
 	var headers headerFlags
+	var showVersion bool
 
 	flag.StringVar(&cfg.ListFile, "l", "", "File containing list of URLs to scan")
 	flag.StringVar(&cfg.ListFile, "list", "", "File containing list of URLs to scan")
 	flag.StringVar(&cfg.KnownFile, "k", "", "Extra known-endpoints file to filter against")
 	flag.StringVar(&cfg.KnownFile, "known", "", "Extra known-endpoints file to filter against")
 	flag.StringVar(&cfg.LocalJS, "js", "", "Local JS file to analyze")
-	flag.StringVar(&cfg.HTTPXJSON, "httpx-json", "", "Read {url,body} from httpx -json -irr JSONL (body-reuse, no fetch)")
+	flag.StringVar(&cfg.HTTPXJSON, "httpx-json", "", "Read {url,body} from httpx -json -irr JSONL (body-reuse, no fetch; - = stdin)")
 	flag.StringVar(&cfg.BaseURL, "b", "", "Base URL for resolving relative paths")
 	flag.StringVar(&cfg.BaseURL, "base", "", "Base URL for resolving relative paths")
 	flag.StringVar(&cfg.Scope, "scope", "", "Only output endpoints on this domain + subdomains (D + *.D)")
@@ -641,7 +856,7 @@ func main() {
 	flag.Float64Var(&cfg.RatePerSec, "rate", 0, "Max requests per second (0 = unlimited)")
 	flag.StringVar(&cfg.UserAgent, "ua", defaultUA, "User-Agent string")
 	flag.StringVar(&cfg.FlareSolvrURL, "flaresolverr", "", "FlareSolverr URL (e.g. http://localhost:8191)")
-	flag.StringVar(&cfg.OutputFile, "o", "", "Output file path")
+	flag.StringVar(&cfg.OutputFile, "o", "", "Output file path (default/--urls-only: 1 URL per line)")
 	flag.StringVar(&cfg.OutputFile, "output", "", "Output file path")
 	flag.StringVar(&cfg.OutPrefix, "out-prefix", "", "Write <p>.txt (plain urls) + <p>.jsonl (rich) + <p>.curl.sh in one run")
 	flag.BoolVar(&cfg.OutputJSON, "json", false, "Output as JSON")
@@ -655,10 +870,11 @@ func main() {
 	flag.BoolVar(&cfg.Fuzz, "fuzz", false, "Replace {param} placeholders with FUZZ in output")
 	flag.BoolVar(&cfg.Curl, "curl", false, "Output ready-to-run curl commands")
 	flag.StringVar(&cfg.BodyFormat, "body-format", "json", "Body format for non-GET curl: json|form|both")
-	flag.BoolVar(&cfg.IncludeAssets, "include-assets", false, "Include static asset URLs (JS/CSS/images)")
+	flag.BoolVar(&cfg.IncludeAssets, "include-assets", false, "Include static asset URLs (JS/CSS/images, dynamic import() chunks, sourcemaps)")
 	flag.BoolVar(&cfg.IncludeExternal, "include-external", true, "Include URLs from external domains (default true; narrow with --scope/-bs)")
-	flag.Var(&headers, "H", "Extra HTTP header (repeatable)")
+	flag.Var(&headers, "H", "Extra HTTP header \"Name: value\" (repeatable; sent on every request)")
 	flag.Var(&headers, "header", "Extra HTTP header")
+	flag.BoolVar(&showVersion, "version", false, "Print version")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, banner, version)
@@ -671,14 +887,32 @@ func main() {
 		os.Args = append([]string{os.Args[0]}, reorderArgsForParsing(os.Args[1:])...)
 	}
 	flag.Parse()
+	if showVersion {
+		fmt.Println(version)
+		return 0
+	}
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "ua" {
+			cfg.UAExplicit = true
+		}
+	})
 
 	cfg.ExtraHeaders = headers
+	for _, b := range parseHeaders(cfg) {
+		logErr("ignoring malformed -H %q (expected \"Name: value\")", b)
+	}
 	cfg.MaxBodyBytes = int64(maxBodyMB * 1024 * 1024)
 	if cfg.BodyFormat != "form" && cfg.BodyFormat != "both" {
 		cfg.BodyFormat = "json"
 	}
 	if cfg.Threads < 1 {
 		cfg.Threads = 1 // -t 0 would deadlock (no workers, blocked feeder)
+	}
+	if cfg.Scope != "" {
+		cfg.Scope = normScopeArg(cfg.Scope)
+	}
+	if cfg.ScopeExact.domain != "" {
+		cfg.ScopeExact.domain = normScopeArg(cfg.ScopeExact.domain)
 	}
 
 	httpClient = buildClient(cfg)
@@ -687,38 +921,45 @@ func main() {
 		fmt.Fprintf(os.Stderr, banner, version)
 	}
 
-	// ── Collect input URLs (mode fetch/local) ──
+	// ── Collect input ──
 	known := newKnownSet()
 	var scanItems []WorkItem
+	var jsonlIn io.Reader
 
-	if cfg.HTTPXJSON == "" {
-		for _, u := range flag.Args() {
-			cfg.URLs = append(cfg.URLs, u)
+	if cfg.HTTPXJSON != "" {
+		if cfg.HTTPXJSON == "-" {
+			jsonlIn = os.Stdin
+		} else {
+			f, err := os.Open(cfg.HTTPXJSON)
+			if err != nil {
+				logErr("error opening httpx-json: %v", err)
+				return 1
+			}
+			defer f.Close()
+			jsonlIn = f
 		}
-		stat, _ := os.Stdin.Stat()
-		if len(cfg.URLs) == 0 && cfg.ListFile == "" && cfg.LocalJS == "" && (stat.Mode()&os.ModeCharDevice) == 0 {
-			scanner := bufio.NewScanner(os.Stdin)
-			for scanner.Scan() {
-				line := strings.TrimSpace(scanner.Text())
-				if line != "" && !strings.HasPrefix(line, "#") {
-					cfg.URLs = append(cfg.URLs, line)
+	} else {
+		cfg.URLs = append(cfg.URLs, flag.Args()...)
+		if len(cfg.URLs) == 0 && cfg.ListFile == "" && cfg.LocalJS == "" {
+			if stat, err := os.Stdin.Stat(); err == nil && (stat.Mode()&os.ModeCharDevice) == 0 {
+				if err := readURLList(os.Stdin, &cfg.URLs); err != nil {
+					logErr("error reading stdin: %v", err)
+					return 1
 				}
 			}
 		}
 		if cfg.ListFile != "" {
 			f, err := os.Open(cfg.ListFile)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error opening list file: %v\n", err)
-				os.Exit(1)
+				logErr("error opening list file: %v", err)
+				return 1
 			}
-			scanner := bufio.NewScanner(f)
-			for scanner.Scan() {
-				line := strings.TrimSpace(scanner.Text())
-				if line != "" && !strings.HasPrefix(line, "#") {
-					cfg.URLs = append(cfg.URLs, line)
-				}
-			}
+			err = readURLList(f, &cfg.URLs)
 			f.Close()
+			if err != nil {
+				logErr("error reading list file: %v", err)
+				return 1
+			}
 		}
 		for _, u := range cfg.URLs {
 			scanItems = append(scanItems, WorkItem{URL: u})
@@ -726,31 +967,30 @@ func main() {
 		if cfg.LocalJS != "" {
 			f, err := os.Open(cfg.LocalJS)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error reading JS file: %v\n", err)
-				os.Exit(1)
+				logErr("error reading JS file: %v", err)
+				return 1
 			}
 			data, err := io.ReadAll(io.LimitReader(f, cfg.MaxBodyBytes))
 			f.Close()
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error reading JS file: %v\n", err)
-				os.Exit(1)
+				logErr("error reading JS file: %v", err)
+				return 1
 			}
 			if bytes.IndexByte(data, 0) != -1 {
-				fmt.Fprintf(os.Stderr, "Error: %s looks binary, refusing to scan\n", cfg.LocalJS)
-				os.Exit(1)
+				logErr("%s looks binary, refusing to scan", cfg.LocalJS)
+				return 1
 			}
-			scanItems = append(scanItems, WorkItem{URL: cfg.LocalJS, IsLocal: true, Content: string(data)})
+			scanItems = append(scanItems, WorkItem{URL: cfg.LocalJS, PageURL: cfg.BaseURL, IsLocal: true, Content: string(data)})
 		}
 		if len(scanItems) == 0 {
-			fmt.Fprintf(os.Stderr, "No input. Use -l list.txt, -js file.js, --httpx-json file, or pipe URLs via stdin.\n")
+			logErr("no input. Use -l list.txt, -js file.js, --httpx-json file, or pipe URLs via stdin.")
 			flag.Usage()
-			os.Exit(1)
+			return 1
 		}
-		// default: input URLs auto-known
 		hasLocal := false
 		for _, item := range scanItems {
 			if !item.IsLocal {
-				known.Add(item.URL)
+				known.Add(item.URL) // input URL otomatis known
 			} else {
 				hasLocal = true
 			}
@@ -760,22 +1000,22 @@ func main() {
 		}
 	}
 
-	// Additional known file (-k)
 	if cfg.KnownFile != "" {
 		f, err := os.Open(cfg.KnownFile)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error opening known file: %v\n", err)
-			os.Exit(1)
+			logErr("error opening known file: %v", err)
+			return 1
 		}
-		scanner := bufio.NewScanner(f)
-		scanner.Buffer(make([]byte, 1024*1024), 8*1024*1024)
-		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if line != "" {
-				known.Add(line)
-			}
-		}
+		var lines []string
+		err = readURLList(f, &lines)
 		f.Close()
+		if err != nil {
+			logErr("error reading known file: %v", err)
+			return 1
+		}
+		for _, l := range lines {
+			known.Add(l)
+		}
 	}
 
 	if cfg.HTTPXJSON != "" {
@@ -784,66 +1024,64 @@ func main() {
 		logInfo(cfg, "%s[*]%s Scanning %d URL(s) | %d known endpoints to filter", cCyan, cReset, len(scanItems), known.Size())
 	}
 
-	// ── Scan ──
-	sigCh := make(chan os.Signal, 1)
+	// ── Interrupt: sinyal pertama = berhenti rapi (hasil parsial tetap
+	// ditulis, exit 130); sinyal kedua = keluar paksa.
+	var stopping atomic.Bool
+	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		stopping.Store(true)
+		logErr("interrupted — finishing in-flight work and writing partial results (Ctrl-C again to abort)")
+		<-sigCh
+		os.Exit(130)
+	}()
 
 	workCh := make(chan WorkItem, cfg.Threads)
-
 	var (
-		mu       sync.Mutex
-		allFound []Endpoint
-		wg       sync.WaitGroup
+		mu      sync.Mutex
+		results []recResult
+		wg      sync.WaitGroup
+		done    int64
+		skipExt int64
 	)
-	globalSeen := make(map[string]bool)
 	rl := newRateLimiter(cfg.RatePerSec)
 	defer rl.Stop()
 
-	var total int64
-	if cfg.HTTPXJSON == "" {
-		total = int64(len(scanItems))
-	}
-	var done int64
-
+	total := int64(len(scanItems))
 	printProgress := func() {
 		if cfg.Silent {
 			return
 		}
 		cur := atomic.LoadInt64(&done)
 		if total > 0 {
-			pct := int(float64(cur) / float64(total) * 100)
-			fmt.Fprintf(os.Stderr, "\r%s[*]%s Progress: %d/%d (%d%%)   ", cCyan, cReset, cur, total, pct)
+			fmt.Fprintf(os.Stderr, "\r%s[*]%s Progress: %d/%d (%d%%)   ", cCyan, cReset, cur, total, int(float64(cur)/float64(total)*100))
 		} else {
 			fmt.Fprintf(os.Stderr, "\r%s[*]%s Processed: %d   ", cCyan, cReset, cur)
 		}
 	}
 
-	// Workers
 	for i := 0; i < cfg.Threads; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for item := range workCh {
+				if stopping.Load() {
+					continue // kuras antrean tanpa kerja
+				}
 				if !item.IsLocal {
 					if rl == nil {
-						// tanpa rate-limiter → delay per request
 						if cfg.DelayMs > 0 {
 							time.Sleep(time.Duration(cfg.DelayMs) * time.Millisecond)
 						}
 					} else {
-						// rate-limiter aktif → delay TIDAK ditumpuk (hindari double-limit)
-						rl.Wait()
+						rl.Wait() // rate-limiter aktif -> delay tidak ditumpuk
 					}
 				}
-				found := processURL(cfg, item, known, cfg.BaseURL)
+				r := processItem(cfg, item, known)
+				atomic.AddInt64(&skipExt, int64(r.skipped))
 				mu.Lock()
-				for _, ep := range found {
-					key := dedupKey(ep.AbsURL)
-					if !globalSeen[key] {
-						globalSeen[key] = true
-						allFound = append(allFound, ep)
-					}
-				}
+				results = append(results, r)
 				mu.Unlock()
 				atomic.AddInt64(&done, 1)
 				printProgress()
@@ -851,141 +1089,198 @@ func main() {
 		}()
 	}
 
-	// Feeder (streaming untuk httpx-json, pre-list untuk mode lain)
-	go func() {
-		defer close(workCh)
-		if cfg.HTTPXJSON != "" {
-			var input io.Reader
-			if cfg.HTTPXJSON == "-" {
-				input = os.Stdin
-			} else {
-				f, err := os.Open(cfg.HTTPXJSON)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error opening httpx-json: %v\n", err)
-					return
-				}
-				defer f.Close()
-				input = f
+	// Feeder (streaming untuk httpx-json)
+	var inErr error
+	var skippedLines, badLines, binLines int
+	seq := 0
+	if jsonlIn != nil {
+		skippedLines, inErr = readJSONLines(jsonlIn, maxJSONLLine, func(line []byte) bool {
+			if stopping.Load() {
+				return false
 			}
-			sc := bufio.NewScanner(input)
-			sc.Buffer(make([]byte, 1024*1024), 64*1024*1024)
-			for sc.Scan() {
-				line := sc.Bytes()
-				if len(line) == 0 {
-					continue
-				}
-				var rec httpxRecord
-				if json.Unmarshal(line, &rec) != nil {
-					continue
-				}
-				if rec.URL == "" || rec.Body == "" {
-					continue
-				}
-				select {
-				case <-sigCh:
-					return
-				case workCh <- WorkItem{URL: rec.URL, IsLocal: true, Content: rec.Body}:
-				}
+			var rec httpxRecord
+			if json.Unmarshal(line, &rec) != nil {
+				badLines++
+				return true
 			}
-			return
-		}
+			if rec.URL == "" || rec.Body == "" {
+				return true
+			}
+			if isBinaryContent(rec.ContentType, rec.Body) {
+				binLines++
+				return true
+			}
+			if int64(len(rec.Body)) > cfg.MaxBodyBytes {
+				rec.Body = rec.Body[:cfg.MaxBodyBytes] // konsisten dgn batas fetch mode
+			}
+			pageURL := rec.URL
+			if rec.FinalURL != "" {
+				pageURL = rec.FinalURL // base resolusi = URL setelah redirect
+			}
+			workCh <- WorkItem{URL: rec.URL, PageURL: pageURL, IsLocal: true, Content: rec.Body, ContentType: rec.ContentType, seq: seq}
+			seq++
+			return true
+		})
+	} else {
 		for _, item := range scanItems {
-			select {
-			case <-sigCh:
-				return
-			case workCh <- item:
+			if stopping.Load() {
+				break
 			}
+			item.seq = seq
+			seq++
+			workCh <- item
 		}
-	}()
-
+	}
+	close(workCh)
 	wg.Wait()
 	if !cfg.Silent {
 		fmt.Fprintln(os.Stderr)
 	}
+	if inErr != nil {
+		logErr("error reading %s: %v (results are partial)", cfg.HTTPXJSON, inErr)
+	}
+	if skippedLines > 0 {
+		logErr("skipped %d JSONL line(s) larger than %d MB", skippedLines, maxJSONLLine>>20)
+	}
+	if badLines > 0 {
+		logWarn(cfg, "%d malformed JSONL line(s) ignored", badLines)
+	}
+	if binLines > 0 {
+		logVerbose(cfg, "%d binary record(s) skipped", binLines)
+	}
+	if n := atomic.LoadInt64(&skipExt); n > 0 {
+		logInfo(cfg, "%s[i]%s %d absolute URL(s) skipped as external -- re-run with --include-external (or --scope <domain>) to include", cDim, cReset, n)
+	}
+
+	// ── Gabung deterministik (urutan input), atribusi ulang CDN ──
+	sort.Slice(results, func(i, j int) bool { return results[i].seq < results[j].seq })
+	refs := map[string]map[string]bool{}
+	var all, pending []Endpoint
+	for _, r := range results {
+		all = append(all, r.eps...)
+		pending = append(pending, r.pending...)
+		if r.docOrigin == "" {
+			continue
+		}
+		for _, s := range r.refs {
+			k := scriptKey(s)
+			if k == "" {
+				continue
+			}
+			if refs[k] == nil {
+				refs[k] = map[string]bool{}
+			}
+			refs[k][r.docOrigin] = true
+		}
+	}
+	for _, ep := range reattribute(pending, refs) {
+		if keepEndpoint(cfg, ep, known, ep.PageURL) {
+			all = append(all, ep)
+		}
+	}
+	sort.SliceStable(all, func(i, j int) bool {
+		if all[i].seq != all[j].seq {
+			return all[i].seq < all[j].seq
+		}
+		return all[i].pos < all[j].pos
+	})
+	allFound := mergeEndpoints(all)
 
 	// ── Sort & Output ──
 	interestOrder := map[string]int{"HIGH": 0, "MED": 1, "LOW": 2}
-	sort.Slice(allFound, func(i, j int) bool {
-		oi := interestOrder[allFound[i].Interest]
-		oj := interestOrder[allFound[j].Interest]
+	sort.SliceStable(allFound, func(i, j int) bool {
+		oi, oj := interestOrder[allFound[i].Interest], interestOrder[allFound[j].Interest]
 		if oi != oj {
 			return oi < oj
 		}
-		return allFound[i].AbsURL < allFound[j].AbsURL
+		if allFound[i].AbsURL != allFound[j].AbsURL {
+			return allFound[i].AbsURL < allFound[j].AbsURL
+		}
+		return allFound[i].Method < allFound[j].Method
 	})
 
-	var outputLines []string
+	outURL := func(ep Endpoint) string {
+		if cfg.Fuzz {
+			return enrichEndpoint(ep).URL
+		}
+		return ep.AbsURL
+	}
+	uniqueURLs := func() []string {
+		seen := map[string]bool{}
+		var out []string
+		for _, ep := range allFound {
+			u := outURL(ep)
+			if !seen[u] {
+				seen[u] = true
+				out = append(out, u)
+			}
+		}
+		return out
+	}
 
-	if cfg.OutputJSON {
-		var results []Result
+	var fileLines []string
+	switch {
+	case cfg.OutputJSON:
+		results := []Result{}
 		for _, ep := range allFound {
 			e := enrichEndpoint(ep)
-			u := ep.AbsURL
-			if cfg.Fuzz {
-				u = e.URL
-			}
-			results = append(results, Result{
-				URL:      u,
-				Method:   ep.Method,
-				Params:   ep.Params,
-				Body:     e.Body,
-				Interest: ep.Interest,
-				Source:   ep.Source,
-			})
+			results = append(results, Result{URL: outURL(ep), Method: ep.Method, Params: ep.Params, Body: e.Body, Interest: ep.Interest, Source: ep.Source})
 		}
 		data, _ := json.MarshalIndent(results, "", "  ")
 		fmt.Println(string(data))
-		outputLines = []string{string(data)}
-	} else if cfg.URLsOnly {
-		for _, ep := range allFound {
-			u := ep.AbsURL
-			if cfg.Fuzz {
-				u = enrichEndpoint(ep).URL
-			}
+		fileLines = []string{string(data)}
+	case cfg.URLsOnly:
+		fileLines = uniqueURLs()
+		for _, u := range fileLines {
 			fmt.Println(u)
-			outputLines = append(outputLines, u)
 		}
-	} else if cfg.Curl {
+	case cfg.Curl:
 		for _, ep := range allFound {
 			for _, cl := range buildCurl(ep, cfg.BodyFormat) {
 				fmt.Println(cl)
-				outputLines = append(outputLines, cl)
+				fileLines = append(fileLines, cl)
 			}
 		}
-	} else {
+	default:
 		if len(allFound) == 0 {
 			logInfo(cfg, "%s[-]%s No new endpoints found.", cDim, cReset)
 		} else {
 			logInfo(cfg, "%s[+]%s Found %d new endpoint(s):\n", cGreen, cReset, len(allFound))
 			for _, ep := range allFound {
-				if cfg.Fuzz {
-					ep.AbsURL = enrichEndpoint(ep).URL
-				}
-				line := printEndpoint(cfg, ep)
-				fmt.Println(line)
-				outputLines = append(outputLines, stripANSI(line))
+				ep.AbsURL = outURL(ep)
+				fmt.Println(printEndpoint(cfg, ep))
 			}
 		}
+		// File -o pada mode tabel = 1 URL absolut per baris (kontrak pipeline:
+		// dibaca uro/httpx -l/secrethunter2). Dulu baris tabel "[HIGH] GET url ← src".
+		fileLines = uniqueURLs()
 	}
 
+	rc := 0
 	if cfg.OutPrefix != "" {
-		writeMultiStream(cfg, allFound)
+		if err := writeMultiStream(cfg, allFound); err != nil {
+			logErr("%v", err)
+			rc = 1
+		}
 	}
-
-	if cfg.OutputFile != "" && len(outputLines) > 0 {
-		f, err := os.Create(cfg.OutputFile)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error creating output file: %v\n", err)
+	if cfg.OutputFile != "" {
+		// selalu ditulis (juga saat kosong) agar file basi run sebelumnya tidak terbaca ulang
+		if err := writeLinesFile(cfg.OutputFile, fileLines); err != nil {
+			logErr("%v", err)
+			rc = 1
 		} else {
-			for _, line := range outputLines {
-				fmt.Fprintln(f, line)
-			}
-			f.Close()
 			logInfo(cfg, "\n%s[+]%s Saved to %s", cGreen, cReset, cfg.OutputFile)
 		}
 	}
 
 	logInfo(cfg, "\n%s[*]%s Done. %d new endpoint(s) discovered.", cCyan, cReset, len(allFound))
+	if inErr != nil {
+		rc = 1
+	}
+	if stopping.Load() {
+		return 130
+	}
+	return rc
 }
 
 // applyFuzz replaces all {param} placeholders with FUZZ
@@ -995,25 +1290,24 @@ func applyFuzz(u string) string {
 	return rePlaceholder.ReplaceAllString(u, "FUZZ")
 }
 
-// matchesScope: host == scope atau *.scope
-// twoPartPublicSuffix: suffix publik 2-label umum (terutama .id) — bila
-// 2-label terakhir cocok, pakai 3 label agar evil.co.id != target.co.id.
+// twoPartPublicSuffix: suffix publik 2-label umum — bila 2-label terakhir
+// cocok, pakai 3 label agar evil.co.id != target.co.id.
 var twoPartPublicSuffix = map[string]bool{
 	"ac.id": true, "co.id": true, "or.id": true, "go.id": true,
 	"mil.id": true, "net.id": true, "web.id": true, "my.id": true,
-	"biz.id": true, "ponpes.id": true, "co.uk": true, "org.uk": true,
-	"me.uk": true, "ltd.uk": true, "plc.uk": true, "com.au": true,
+	"biz.id": true, "ponpes.id": true, "sch.id": true, "co.uk": true, "org.uk": true,
+	"me.uk": true, "ltd.uk": true, "plc.uk": true, "ac.uk": true, "gov.uk": true, "com.au": true,
 	"net.au": true, "org.au": true, "co.jp": true, "ne.jp": true,
 	"or.jp": true, "co.in": true, "com.br": true, "com.sg": true,
-	"co.za": true, "com.my": true,
+	"co.za": true, "com.my": true, "com.cn": true, "com.tr": true, "com.mx": true,
+	"co.kr": true, "co.nz": true, "com.vn": true, "com.ph": true,
 }
 
-// registrableDomain: aproksimasi cerdas (api.apps.binus.ac.id -> binus.ac.id).
+// registrableDomain: aproksimasi (api.apps.binus.ac.id -> binus.ac.id).
 // IP/v6 kembali utuh, port dibuang.
 func registrableDomain(host string) string {
 	h := strings.ToLower(strings.TrimSuffix(host, "."))
 	if i := strings.LastIndex(h, ":"); i >= 0 && !strings.Contains(h[i:], "]") {
-		// hati-hati IPv6: hanya strip port berbentuk :angka di akhir
 		if _, err := strconv.Atoi(h[i+1:]); err == nil {
 			h = h[:i]
 		}
@@ -1058,9 +1352,6 @@ func scopeHostForItem(cfg *Config, item WorkItem) string {
 //
 //	bare (`--scope-exact`)         -> modifier: exact-kan --scope / -bs
 //	nilai (`--scope-exact=api.x`)  -> tepat host itu (single-flag, tanpa --scope)
-//
-// IsBoolFlag agar bentuk bare valid; bentuk spasi (`--scope-exact api.x`)
-// TIDAK didukung (api.x akan dianggap URL target) — pakai `=`.
 type exactScopeValue struct {
 	set      bool
 	modifier bool
@@ -1091,13 +1382,11 @@ func normScopeHost(scope string) string {
 func passScopeFilter(cfg *Config, absURL, scopeSrcHost string) bool {
 	h := extractHost(absURL)
 	ex := cfg.ScopeExact
-	// 1. --scope-exact=D : tepat host D (single-flag)
 	if ex.set && ex.domain != "" {
 		if h != "" && h == ex.domain {
 			return true
 		}
 	}
-	// 2. bare --scope-exact : exact-kan --scope / -bs (subtree ikut mati)
 	if ex.set && ex.domain == "" && ex.modifier {
 		if cfg.Scope != "" {
 			return h != "" && h == normScopeHost(cfg.Scope)
@@ -1105,20 +1394,16 @@ func passScopeFilter(cfg *Config, absURL, scopeSrcHost string) bool {
 		if scopeSrcHost != "" {
 			return h != "" && h == strings.ToLower(scopeSrcHost)
 		}
-		// modifier tanpa scope/bs: no-op -> lanjut ke aturan umum
 	}
-	// 3. subtree --scope D (D + *.D)
 	if cfg.Scope != "" && matchesScope(absURL, cfg.Scope) {
 		return true
 	}
-	// 4. -bs : regdom sumber
 	if cfg.BaseScope && scopeSrcHost != "" && h != "" {
 		rh, rs := registrableDomain(h), registrableDomain(scopeSrcHost)
 		if rh != "" && rh == rs {
 			return true
 		}
 	}
-	// 5. default luas: tanpa constraint
 	if cfg.Scope == "" && scopeSrcHost == "" && !(ex.set && ex.domain != "") {
 		return true
 	}
@@ -1130,9 +1415,9 @@ func matchesScope(rawURL, scope string) bool {
 	if err != nil {
 		return false
 	}
-	host := strings.ToLower(u.Hostname())
-	scope = strings.ToLower(strings.TrimPrefix(scope, "*."))
-	return host == scope || strings.HasSuffix(host, "."+scope)
+	host := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
+	scope = normScopeHost(scope)
+	return host != "" && (host == scope || strings.HasSuffix(host, "."+scope))
 }
 
 // stripANSI removes ANSI escape codes for clean file output
@@ -1155,43 +1440,59 @@ func stripANSI(s string) string {
 	return string(result)
 }
 
-// ─── v3: multi-stream output (pipelineable) ────────────────────────────────────
-// One extraction → three purpose-built files:
+// ─── multi-stream output (pipelineable) ──────────────────────────────────────
 //
-//	<p>.txt      plain AbsURL, one per line  → pipe to httpx/ffuf/nuclei
-//	<p>.jsonl    full record per line        → jq / tooling
+//	<p>.txt      AbsURL unik, 1 per baris    → httpx/ffuf/nuclei/secrethunter2
+//	<p>.jsonl    1 record per (url, method)  → api-catcher -ej / jq
 //	<p>.curl.sh  ready-to-run curl commands  → manual testing
-func writeMultiStream(cfg *Config, eps []Endpoint) {
+func writeMultiStream(cfg *Config, eps []Endpoint) error {
 	var urls, jsonls, curls []string
+	seen := map[string]bool{}
 	for _, ep := range eps {
 		e := enrichEndpoint(ep)
 		u := ep.AbsURL
 		if cfg.Fuzz {
 			u = e.URL
 		}
-		urls = append(urls, u)
-		b, _ := json.Marshal(Result{
-			URL: u, Method: ep.Method, Params: ep.Params,
-			Body: e.Body, Interest: ep.Interest, Source: ep.Source,
-		})
+		if !seen[u] {
+			seen[u] = true
+			urls = append(urls, u)
+		}
+		b, _ := json.Marshal(Result{URL: u, Method: ep.Method, Params: ep.Params, Body: e.Body, Interest: ep.Interest, Source: ep.Source})
 		jsonls = append(jsonls, string(b))
 		curls = append(curls, buildCurl(ep, cfg.BodyFormat)...)
 	}
-	writeLinesFile(cfg.OutPrefix+".txt", urls)
-	writeLinesFile(cfg.OutPrefix+".jsonl", jsonls)
-	writeLinesFile(cfg.OutPrefix+".curl.sh", curls)
-	logInfo(cfg, "%s[+]%s Multi-stream: %s.txt (%d) · %s.jsonl · %s.curl.sh",
-		cGreen, cReset, cfg.OutPrefix, len(urls), cfg.OutPrefix, cfg.OutPrefix)
+	var errs []error
+	for _, w := range []struct {
+		p string
+		l []string
+	}{{cfg.OutPrefix + ".txt", urls}, {cfg.OutPrefix + ".jsonl", jsonls}, {cfg.OutPrefix + ".curl.sh", curls}} {
+		if err := writeLinesFile(w.p, w.l); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	logInfo(cfg, "%s[+]%s Multi-stream: %s.txt (%d) · %s.jsonl (%d) · %s.curl.sh",
+		cGreen, cReset, cfg.OutPrefix, len(urls), cfg.OutPrefix, len(jsonls), cfg.OutPrefix)
+	return errors.Join(errs...)
 }
 
-func writeLinesFile(path string, lines []string) {
+// writeLinesFile: tulis atomik-ish (buffer + cek error Close).
+func writeLinesFile(path string, lines []string) error {
 	f, err := os.Create(path)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error creating %s: %v\n", path, err)
-		return
+		return fmt.Errorf("error creating %s: %w", path, err)
 	}
-	defer f.Close()
+	w := bufio.NewWriterSize(f, 1<<16)
 	for _, l := range lines {
-		fmt.Fprintln(f, l)
+		w.WriteString(l)
+		w.WriteByte('\n')
 	}
+	if err := w.Flush(); err != nil {
+		f.Close()
+		return fmt.Errorf("error writing %s: %w", path, err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("error writing %s: %w", path, err)
+	}
+	return nil
 }

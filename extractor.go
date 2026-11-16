@@ -1,23 +1,30 @@
 package main
 
 // ============================================================
-// endpoint-hunter2 — extractor.go (patched)
+// endpoint-hunter2 — extractor.go
 //
-// PERUBAHAN vs v1:
-//   * normaliseTemplateURL: regexp.MustCompile di-hoist ke package var
-//     (dulu compile tiap panggil → berat di file JS besar).
-//   * extractEndpoints: scan seluruh konten SEKALI per pola (bukan per-baris ×
-//     per-pola) + lineIndex untuk nomor baris. Ekstraksi param pakai WINDOW
-//     KARAKTER di sekitar match (bukan ±3 baris) → memperbaiki blowup pada JS
-//     minified (dulu: konteks = seluruh file, di-regex ulang PER match).
+//   * Pra-ekstraksi (normalize.go): decode escape/entity aman, join literal,
+//     propagasi konstanta LINEAR, rekonstruksi route ("/a/"+id, .concat(),
+//     `${x}`) — dengan peta posisi agar source "file:line:col" akurat.
+//   * Pola (patterns.go) dicari lewat anchor literal + regex ter-anchor.
+//   * Resolusi URL per jenis temuan:
+//       - HTML           : base dokumen (<base href> atau URL halaman)
+//       - instance/axios : baseURL deklarasi (join path ala axios)
+//       - route/navigasi : origin halaman
+//       - relatif di JS  : origin aplikasi (fetch relatif ke DOKUMEN, bukan ke
+//                          lokasi file JS); ditandai PageRel agar bisa
+//                          ditempel ulang ke origin halaman yang memuat JS bila
+//                          JS di-host di CDN (lihat main.go reattribute).
+//   * Method & params dari argumen panggilan / objek config yang memuat URL
+//     (context.go), bukan jendela ±500 char (dulu bocor ke panggilan tetangga).
 // ============================================================
 
 import (
 	"fmt"
 	"net/url"
+	"path"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 )
 
@@ -27,276 +34,66 @@ type Endpoint struct {
 	RawURL   string
 	AbsURL   string
 	Method   string
-	Params   []string
-	Source   string
+	Params   []string // gabungan semua param (kompat: field "params" jsonl)
+	Source   string   // "<url-sumber>:<line>:<col>"
 	Line     int
+	Col      int
 	Interest string
+
+	MethodExplicit bool     // method berasal dari kode (bukan default GET)
+	QueryParams    []string // kunci yang pasti query (axios params:, $.get GET)
+	BodyKeys       []string // kunci body (body:/data:/json:, data axios.post)
+	PageRel        bool     // relatif-origin dari JS/JSON (kandidat atribusi ulang)
+	RelPath        string   // path relatif ternormalisasi (diawali "/")
+	PageURL        string   // URL record sumber
+
+	seq, pos int
 }
 
-// ─── Extraction Patterns ──────────────────────────────────────────────────────
-
-type ExtractionPattern struct {
-	Name          string
-	Regex         *regexp.Regexp
-	URLGroup      int
-	MethodGroup   int
-	DefaultMethod string
-	Validate      func(string) bool
-}
-
-var extractionPatterns = []ExtractionPattern{
-	{
-		Name:          "fetch+method",
-		Regex:         regexp.MustCompile(`fetch\s*\(\s*` + bt + `([^` + bte + `\s]+)` + bt + `\s*,\s*\{[^}]*method\s*:\s*['"]([A-Za-z]+)['"]`),
-		URLGroup:      1,
-		MethodGroup:   2,
-		DefaultMethod: "GET",
-	},
-	{
-		Name:          "ofetch/$fetch",
-		Regex:         regexp.MustCompile(`\b(?:ofetch|\$fetch)\s*\(\s*` + bt + `([^` + bte + `\s]{4,})` + bt),
-		URLGroup:      1,
-		DefaultMethod: "GET",
-	},
-	{
-		Name:          "ky",
-		Regex:         regexp.MustCompile(`\bky\s*\.\s*(get|post|put|delete|patch|head)\s*\(\s*` + bt + `([^` + bte + `\s]{4,})` + bt),
-		URLGroup:      2,
-		MethodGroup:   1,
-		DefaultMethod: "GET",
-	},
-	{
-		Name:          "fetch",
-		Regex:         regexp.MustCompile(`\bfetch\s*\(\s*` + bt + `([^` + bte + `\s]{4,})` + bt),
-		URLGroup:      1,
-		DefaultMethod: "GET",
-	},
-	{
-		Name:          "axios.method",
-		Regex:         regexp.MustCompile(`\baxios\s*\.\s*(get|post|put|delete|patch|head|options)\s*\(\s*` + bt + `([^` + bte + `\s]{4,})` + bt),
-		URLGroup:      2,
-		MethodGroup:   1,
-		DefaultMethod: "GET",
-	},
-	{
-		Name:          "axios-config-url-method",
-		Regex:         regexp.MustCompile(`\baxios\s*\(\s*\{[^}]{0,200}url\s*:\s*` + bt + `([^` + bte + `\s]{4,})` + bt + `[^}]{0,200}method\s*:\s*['"]([A-Za-z]+)['"]`),
-		URLGroup:      1,
-		MethodGroup:   2,
-		DefaultMethod: "GET",
-	},
-	{
-		Name:          "axios-config-method-url",
-		Regex:         regexp.MustCompile(`\baxios\s*\(\s*\{[^}]{0,200}method\s*:\s*['"]([A-Za-z]+)['"]\s*,[^}]{0,200}url\s*:\s*` + bt + `([^` + bte + `\s]{4,})` + bt),
-		URLGroup:      2,
-		MethodGroup:   1,
-		DefaultMethod: "GET",
-	},
-	{
-		Name:          "axios.request-method-url",
-		Regex:         regexp.MustCompile(`\baxios\s*\.\s*request\s*\(\s*\{[^}]{0,200}method\s*:\s*['"]([A-Za-z]+)['"]\s*,?[^}]{0,200}url\s*:\s*` + bt + `([^` + bte + `\s]{4,})` + bt),
-		URLGroup:      2,
-		MethodGroup:   1,
-		DefaultMethod: "GET",
-	},
-	{
-		Name:          "axios.request-url-method",
-		Regex:         regexp.MustCompile(`\baxios\s*\.\s*request\s*\(\s*\{[^}]{0,200}url\s*:\s*` + bt + `([^` + bte + `\s]{4,})` + bt + `[^}]{0,200}method\s*:\s*['"]([A-Za-z]+)['"]`),
-		URLGroup:      1,
-		MethodGroup:   2,
-		DefaultMethod: "GET",
-	},
-	{
-		Name:          "axios.request-url",
-		Regex:         regexp.MustCompile(`\baxios\s*\.\s*request\s*\(\s*\{[^}]{0,200}url\s*:\s*` + bt + `([^` + bte + `\s]{4,})` + bt),
-		URLGroup:      1,
-		DefaultMethod: "GET",
-	},
-	{
-		Name:          "instance-method (api/client/...)",
-		Regex:         regexp.MustCompile(`\b(?:api|client|service|axiosInstance|instance|request|httpClient|got)\s*\.\s*(get|post|put|delete|patch|head|options)\s*\(\s*` + bt + `([^` + bte + `\s]{4,})` + bt),
-		URLGroup:      2,
-		MethodGroup:   1,
-		DefaultMethod: "GET",
-	},
-	{
-		Name:          "$http.method (AngularJS)",
-		Regex:         regexp.MustCompile(`\$http\s*\.\s*(get|post|put|delete|patch|head)\s*\(\s*` + bt + `([^` + bte + `\s]{4,})` + bt),
-		URLGroup:      2,
-		MethodGroup:   1,
-		DefaultMethod: "GET",
-	},
-	{
-		Name:          "$http(config)-method-url",
-		Regex:         regexp.MustCompile(`\$http\s*\(\s*\{[^}]{0,200}method\s*:\s*['"]([A-Za-z]+)['"]\s*,?[^}]{0,200}url\s*:\s*` + bt + `([^` + bte + `\s]{4,})` + bt),
-		URLGroup:      2,
-		MethodGroup:   1,
-		DefaultMethod: "GET",
-	},
-	{
-		Name:          "$http(config)-url-method",
-		Regex:         regexp.MustCompile(`\$http\s*\(\s*\{[^}]{0,200}url\s*:\s*` + bt + `([^` + bte + `\s]{4,})` + bt + `[^}]{0,200}method\s*:\s*['"]([A-Za-z]+)['"]`),
-		URLGroup:      1,
-		MethodGroup:   2,
-		DefaultMethod: "GET",
-	},
-	{
-		Name:          "XHR.open",
-		Regex:         regexp.MustCompile(`\.open\s*\(\s*['"]([A-Z]+)['"]\s*,\s*` + bt + `([^` + bte + `\s]{4,})` + bt),
-		URLGroup:      2,
-		MethodGroup:   1,
-		DefaultMethod: "GET",
-	},
-	{
-		Name:          "$.ajax",
-		Regex:         regexp.MustCompile(`\$\.ajax\s*\(\s*\{[^}]{0,300}url\s*:\s*` + bt + `([^` + bte + `\s]{4,})` + bt),
-		URLGroup:      1,
-		DefaultMethod: "GET",
-	},
-	{
-		Name:          "$.get/post",
-		Regex:         regexp.MustCompile(`\$\.(get|post|put|delete)\s*\(\s*` + bt + `([^` + bte + `\s]{4,})` + bt),
-		URLGroup:      2,
-		MethodGroup:   1,
-		DefaultMethod: "GET",
-	},
-	{
-		Name:          "superagent",
-		Regex:         regexp.MustCompile(`\brequest\s*\.\s*(get|post|put|delete|patch)\s*\(\s*` + bt + `([^` + bte + `\s]{4,})` + bt),
-		URLGroup:      2,
-		MethodGroup:   1,
-		DefaultMethod: "GET",
-	},
-	{
-		Name:          "router-definition",
-		Regex:         regexp.MustCompile(`(?:router|app)\s*\.\s*(get|post|put|delete|patch|all|use)\s*\(\s*` + bt + `([^` + bte + `\s]{2,})` + bt),
-		URLGroup:      2,
-		MethodGroup:   1,
-		DefaultMethod: "GET",
-	},
-	{
-		Name:          "url-var-assignment",
-		Regex:         regexp.MustCompile(`(?i)(?:^|[,\s{(])(?:url|endpoint|path|apiPath|apiUrl|baseUrl|actionUrl|href|action)\s*[=:]\s*` + bt + `(\/?(?:https?:\/\/|\/)[^` + bte + `\s<>{}|\\^]{4,})` + bt),
-		URLGroup:      1,
-		DefaultMethod: "GET",
-	},
-	{
-		Name:          "api-path-literal",
-		Regex:         regexp.MustCompile(`['"\x60](\/(?:api|v\d+|internal|admin|auth|rest|graphql|_api|service|backend|private|management|debug|config|webhook|callback|oauth|token|user|account|payment|order|search|upload|download|export|import|report|dashboard|panel|portal|rpc|ws|socket)[\/a-zA-Z0-9_\-\.{}:@!$&()*+,;=%?#]{2,})['"\x60]`),
-		URLGroup:      1,
-		DefaultMethod: "GET",
-	},
-	{
-		Name:          "absolute-url",
-		Regex:         regexp.MustCompile(`['"\x60]((?:https?|wss?)://[a-zA-Z0-9\-\.]+(?::[0-9]+)?\/[^\s'"\x60<>(){}|\\^]{4,})['"\x60]`),
-		URLGroup:      1,
-		DefaultMethod: "GET",
-	},
-	{
-		Name:          "location-assign",
-		Regex:         regexp.MustCompile(`(?i)(?:window\.)?location(?:\.href)?\s*=\s*` + bt + `([^` + bte + `\s\\]{2,})` + bt),
-		URLGroup:      1,
-		DefaultMethod: "GET",
-	},
-	{
-		Name:          "href-assign",
-		Regex:         regexp.MustCompile(`\.[Hh][Rr][Ee][Ff]\s*=\s*` + bt + `([^` + bte + `\s\\]{2,})` + bt),
-		URLGroup:      1,
-		DefaultMethod: "GET",
-	},
-	{
-		Name:          "generic-quoted-path",
-		Regex:         regexp.MustCompile(bt + `(\/[^\s` + bte + `\\<>]{2,})` + bt),
-		URLGroup:      1,
-		DefaultMethod: "GET",
-		Validate:      validGenericPathEP,
-	},
-	{
-		Name:          "bare-path-prose",
-		Regex:         regexp.MustCompile(`(?:^|[\s(,;])(\/(?:[A-Za-z0-9_~.\-%]+\/)+[A-Za-z0-9_~.\-%?#\/]*)`), 
-		URLGroup:      1,
-		DefaultMethod: "GET",
-		Validate:      validGenericPathEP,
-	},
-	{
-		Name:          "json-path-key",
-		Regex:         regexp.MustCompile(`"(\/[^"\s\\]{1,120})"\s*:`),
-		URLGroup:      1,
-		DefaultMethod: "GET",
-	},
-	{
-		Name:          "yaml-path-key",
-		Regex:         regexp.MustCompile(`(?m)^[ \t]*(\/[^:\s]{1,120})\s*:`),
-		URLGroup:      1,
-		DefaultMethod: "GET",
-	},
-}
-
-const bt = `['"\x60]`
-const bte = `'"\x60`
-
-// ─── Parameter Extraction ─────────────────────────────────────────────────────
+// key url-var yang berarti navigasi/route halaman (bukan endpoint API)
+var routeKeys = map[string]bool{"path": true, "href": true, "action": true, "to": true, "redirectto": true, "redirecturl": true, "redirect": true, "link": true}
 
 var (
-	reQueryParam   = regexp.MustCompile(`[?&]([a-zA-Z_][a-zA-Z0-9_\-]*)=`)
-	rePathParam    = regexp.MustCompile(`\{([a-zA-Z_][a-zA-Z0-9_]*)\}|/:([a-zA-Z_][a-zA-Z0-9_]*)`)
-	reTemplateVar  = regexp.MustCompile(`\$\{([a-zA-Z_][a-zA-Z0-9_\.]*)\}`)
-	reBodyParam    = regexp.MustCompile(`(?:body|data|json|payload|params|fields)\s*[=:]\s*(?:JSON\.stringify\s*\(\s*)?\{([^}]{1,300})\}`)
-	reBodyParamKey = regexp.MustCompile(`['"]?([a-zA-Z_][a-zA-Z0-9_]*)['"]?\s*:`)
-	// v2: hoisted (dulu di-compile tiap normaliseTemplateURL dipanggil)
-	reConcatTail = regexp.MustCompile(`\s*\+\s*\w+\s*$`)
-	// leaktest-2026-10: pra-ekstraksi untuk bundle obfuscated.
-	reHexEscEP   = regexp.MustCompile(`\\x([0-9a-fA-F]{2})`)
-	reUniEscEP   = regexp.MustCompile(`\\u([0-9a-fA-F]{4})`)
-	reConcatDQEP = regexp.MustCompile(`"([^"\\\n]*)"\s*\+\s*"([^"\\\n]*)"`)
-	reConcatSQEP = regexp.MustCompile(`'([^'\\\n]*)'\s*\+\s*'([^'\\\n]*)'`)
-	reArrJoinEP  = regexp.MustCompile(`\[((?:"[^"\\\n]*"|'[^'\\\n]*')(?:\s*,\s*(?:"[^"\\\n]*"|'[^'\\\n]*'))*)\]\.join\(\s*(?:"/"|'/'|""|'')\s*\)`)
-	reVarAssignEP = regexp.MustCompile(`(?:(?:var|let|const)\s+|,)([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*("([^"\\\n]{2,200})"|'([^'\\\n]{2,200})')`)
-	reQuotedEP = regexp.MustCompile(`"([^"\\\n]*)"|'([^'\\\n]*)'`)
+	reTemplateVar = regexp.MustCompile(`\$\{([^{}]+)\}`)
+	reQueryParam  = regexp.MustCompile(`[?&]([a-zA-Z_][a-zA-Z0-9_\-\[\]]*)=`)
+	rePathParam   = regexp.MustCompile(`\{([a-zA-Z_][a-zA-Z0-9_]*)\}|/:([a-zA-Z_][a-zA-Z0-9_]*)`)
+	reNextDynSeg  = regexp.MustCompile(`/\[\[?(?:\.\.\.)?([A-Za-z_][A-Za-z0-9_]*)\]\]?`)
+	reSchemeEP    = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9+.\-]*:`)
+	reMimeLike    = regexp.MustCompile(`^(?:application|text|image|audio|video|font|multipart|model|message)/[A-Za-z0-9.+\-]+$`)
+	reBaseHref    = regexp.MustCompile(`(?i)<base\b[^>]*?\bhref\s*=\s*["']([^"']+)["']`)
+	reScriptSrc   = regexp.MustCompile(`(?i)<script\b[^>]*?\bsrc\s*=\s*["']([^"']+)["']`)
+	reFormTag     = regexp.MustCompile(`(?i)<form\b([^>]{0,800})>`)
+	reFormAction  = regexp.MustCompile(`(?i)\baction\s*=\s*["']([^"']*)["']`)
+	reFormMethod  = regexp.MustCompile(`(?i)\bmethod\s*=\s*["']?([A-Za-z]+)`)
 )
 
-func extractParams(rawURL string, contextLines []string) []string {
-	seen := make(map[string]bool)
-	var params []string
-
-	add := func(p string) {
-		p = strings.TrimSpace(p)
-		if p != "" && !seen[p] && len(p) < 40 {
-			seen[p] = true
-			params = append(params, p)
-		}
-	}
-
+func urlParams(rawURL string) []string {
+	var out []string
 	for _, m := range reQueryParam.FindAllStringSubmatch(rawURL, -1) {
-		add(m[1])
+		out = append(out, m[1])
 	}
 	for _, m := range rePathParam.FindAllStringSubmatch(rawURL, -1) {
 		if m[1] != "" {
-			add(m[1])
+			out = append(out, m[1])
 		} else {
-			add(m[2])
+			out = append(out, m[2])
 		}
 	}
-	for _, m := range reTemplateVar.FindAllStringSubmatch(rawURL, -1) {
-		add(m[1])
-	}
-
-	ctx := strings.Join(contextLines, "\n")
-	for _, m := range reBodyParam.FindAllStringSubmatch(ctx, -1) {
-		for _, km := range reBodyParamKey.FindAllStringSubmatch(m[1], -1) {
-			k := km[1]
-			if k != "" && k != "true" && k != "false" && k != "null" {
-				add(k)
-			}
-		}
-	}
-	return params
+	return out
 }
 
-// normaliseTemplateURL converts ${var} → {var} and removes trailing concat noise
+// normaliseTemplateURL: ${a.id} -> {id}; "{BASE}/x" -> "/x"; Next.js /[id] -> /{id}.
 func normaliseTemplateURL(raw string) string {
-	s := reTemplateVar.ReplaceAllString(raw, `{$1}`)
-	s = reConcatTail.ReplaceAllString(s, `/{param}`)
+	s := raw
+	if strings.Contains(s, "${") {
+		s = reTemplateVar.ReplaceAllStringFunc(s, func(m string) string {
+			return "{" + lastIdent(m[2:len(m)-1]) + "}"
+		})
+	}
+	s = dropLeadingPlaceholder(s)
+	if strings.Contains(s, "/[") {
+		s = reNextDynSeg.ReplaceAllString(s, "/{$1}")
+	}
 	return s
 }
 
@@ -316,16 +113,55 @@ var mediumKeywords = []string{
 	"graphql", "rest", "rpc", "ws", "socket", "report", "search",
 }
 
-func scoreInterest(u string) string {
-	lower := strings.ToLower(u)
-	for _, kw := range highKeywords {
-		if strings.Contains(lower, kw) {
-			return "HIGH"
+// urlTokens: kata dari URL (pisah non-alnum + camelCase), lowercase.
+// Dulu substring mentah: "dev" cocok "devices", "test" cocok "latest",
+// "ws" cocok "news", "rest" cocok "interest" -> skor HIGH/MED palsu.
+func urlTokens(u string) []string {
+	var toks []string
+	cur := make([]byte, 0, 32)
+	flush := func() {
+		if len(cur) > 0 {
+			toks = append(toks, strings.ToLower(string(cur)))
+			cur = cur[:0]
 		}
 	}
-	for _, kw := range mediumKeywords {
-		if strings.Contains(lower, kw) {
-			return "MED"
+	for i := 0; i < len(u); i++ {
+		c := u[i]
+		isAl := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+		if !isAl {
+			flush()
+			continue
+		}
+		if c >= 'A' && c <= 'Z' && i > 0 && u[i-1] >= 'a' && u[i-1] <= 'z' {
+			flush()
+		}
+		cur = append(cur, c)
+	}
+	flush()
+	return toks
+}
+
+func kwHit(tok, kw string) bool {
+	if !strings.HasPrefix(tok, kw) {
+		return false
+	}
+	return len(tok) == len(kw) || (len(tok) == len(kw)+1 && tok[len(kw)] == 's') || len(kw) >= 5
+}
+
+func scoreInterest(u string) string {
+	toks := urlTokens(u)
+	for _, t := range toks {
+		for _, kw := range highKeywords {
+			if kwHit(t, kw) {
+				return "HIGH"
+			}
+		}
+	}
+	for _, t := range toks {
+		for _, kw := range mediumKeywords {
+			if kwHit(t, kw) {
+				return "MED"
+			}
 		}
 	}
 	return "LOW"
@@ -334,50 +170,91 @@ func scoreInterest(u string) string {
 // ─── Static Asset Filter ──────────────────────────────────────────────────────
 
 var staticExtensions = map[string]bool{
-	".js": true, ".css": true, ".png": true, ".jpg": true, ".jpeg": true,
+	".js": true, ".mjs": true, ".css": true, ".png": true, ".jpg": true, ".jpeg": true,
 	".gif": true, ".svg": true, ".ico": true, ".woff": true, ".woff2": true,
-	".ttf": true, ".eot": true, ".otf": true, ".map": true, ".mp4": true,
-	".webp": true, ".pdf": true, ".zip": true, ".gz": true,
+	".ttf": true, ".eot": true, ".otf": true, ".map": true, ".mp4": true, ".webm": true,
+	".webp": true, ".avif": true, ".pdf": true, ".zip": true, ".gz": true, ".mp3": true,
 }
 
-var staticHosts = []string{
-	"cdn.", "fonts.googleapis.com", "fonts.gstatic.com", "jquery.com",
-	"bootstrapcdn.com", "cdnjs.cloudflare.com", "unpkg.com",
-	"jsdelivr.net", "ajax.googleapis.com", "static.", "assets.",
+// host aset murni (cocok penuh / subdomain-nya)
+var staticHostSuffixes = []string{
+	"fonts.googleapis.com", "fonts.gstatic.com", "jquery.com",
+	"bootstrapcdn.com", "cdnjs.cloudflare.com", "unpkg.com", "jsdelivr.net",
+	"ajax.googleapis.com",
 }
 
-func isStaticAsset(rawURL string) bool {
-	path := rawURL
-	if idx := strings.Index(path, "?"); idx > 0 {
-		path = path[:idx]
+// label host pertama yang menandai host aset (cdn.x / static.x / assets.x)
+var staticHostLabels = []string{"cdn", "static", "assets"}
+
+func isStaticExt(rawURL string) bool {
+	p := rawURL
+	if u, err := url.Parse(rawURL); err == nil {
+		p = u.Path
+	} else if i := strings.IndexAny(p, "?#"); i >= 0 {
+		p = p[:i]
 	}
-	for ext := range staticExtensions {
-		if strings.HasSuffix(strings.ToLower(path), ext) {
+	return staticExtensions[strings.ToLower(path.Ext(p))]
+}
+
+func isStaticHost(host string) bool {
+	host = strings.ToLower(host)
+	for _, h := range staticHostSuffixes {
+		if host == h || strings.HasSuffix(host, "."+h) {
 			return true
 		}
 	}
-	lower := strings.ToLower(rawURL)
-	for _, h := range staticHosts {
-		if strings.Contains(lower, h) {
+	first := host
+	if i := strings.IndexByte(host, '.'); i > 0 {
+		first = host[:i]
+	}
+	for _, l := range staticHostLabels {
+		if first == l {
 			return true
 		}
 	}
 	return false
 }
 
+// isStaticAsset: ekstensi aset pada PATH, atau host aset. Dulu substring di
+// SELURUH URL: "/api/assets.list" atau "?ref=static.x" ikut terbuang (FN).
+func isStaticAsset(rawURL string) bool {
+	return isStaticExt(rawURL) || isStaticHost(extractHost(rawURL))
+}
+
 // ─── Base URL Auto-Detection ──────────────────────────────────────────────────
 
-var baseURLDeclarations = []*regexp.Regexp{
-	regexp.MustCompile(`(?i)axios\s*\.defaults\s*\.baseURL\s*=\s*['"](\s*https?://[^'"]{5,120})\s*['"]`),
-	regexp.MustCompile(`(?i)axios\s*\.create\s*\(\s*\{[^}]{0,200}baseURL\s*:\s*['"](\s*https?://[^'"]{5,120})\s*['"]`),
-	regexp.MustCompile(`(?i)base[_]?[Uu][Rr][Ll]\s*[=:]\s*['"](\s*https?://[^'"]{5,120})\s*['"]`),
-	regexp.MustCompile(`(?i)API[_]?BASE(?:[_]?URL)?\s*[=:]\s*['"](\s*https?://[^'"]{5,120})\s*['"]`),
-	regexp.MustCompile(`(?i)api[_]?(?:url|endpoint|host|root|server|origin)\s*[=:]\s*['"](\s*https?://[^'"]{5,120})\s*['"]`),
-	regexp.MustCompile(`(?i)root[_]?[Uu][Rr][Ll]\s*[=:]\s*['"](\s*https?://[^'"]{5,120})\s*['"]`),
-	regexp.MustCompile(`(?i)(?:server|backend|service)[_]?[Uu][Rr][Ll]\s*[=:]\s*['"](\s*https?://[^'"]{5,120})\s*['"]`),
-	regexp.MustCompile(`(?i)(?:VUE_APP|REACT_APP|NEXT_PUBLIC|VITE)(?:_PUBLIC)?[_]?(?:API[_]?BASE[_]?URL|API[_]?URL|API[_]?BASE|API[_]?ENDPOINT|BACKEND[_]?URL)\s*[=:]\s*['"](\s*https?://[^'"]{5,120})\s*['"]`),
-	regexp.MustCompile(`process\.env\.\w+\s*\|\|\s*['"](\s*https?://[^'"]{5,120})\s*['"]`),
-	regexp.MustCompile(`(?i)(?:^|[,\s{(])(?:host|origin|domain|endpoint)\s*[=:]\s*['"](\s*https?://[^'"]{5,120})\s*['"]`),
+const baseVal = `\s*((?:https?://[^'"\s]{3,120})|/[A-Za-z0-9_\-./]{1,80})\s*`
+const baseAbs = `\s*(https?://[^'"\s]{3,120})\s*`
+
+type declPat struct {
+	re      *regexp.Regexp // ter-anchor ^
+	anchors []string       // lowercase
+	pre     func(string, int) bool
+	maxLen  int
+}
+
+func dp(src string, maxLen int, pre func(string, int) bool, anchors ...string) declPat {
+	return declPat{regexp.MustCompile(`^(?:` + src + `)`), anchors, pre, maxLen}
+}
+
+// Deklarasi base eksplisit. ['"]? setelah nama key: kunci JSON ("apiUrl": "...")
+// juga cocok (dulu tidak).
+var baseDecls = []declPat{
+	dp(`(?i)axios\s*\.\s*defaults\s*\.\s*baseURL\s*=\s*['"]`+baseVal+`['"]`, 300, nil, "axios"),
+	dp(`(?i)axios\s*\.\s*create\s*\(\s*\{[^}]{0,200}?baseURL['"]?\s*:\s*['"]`+baseVal+`['"]`, 500, nil, "axios"),
+	dp(`(?i)base[_]?url['"]?\s*[=:]\s*['"]`+baseVal+`['"]`, 300, nil, "baseurl", "base_url"),
+	dp(`(?i)API[_]?BASE(?:[_]?URL)?['"]?\s*[=:]\s*['"]`+baseVal+`['"]`, 300, nil, "api_base", "apibase"),
+	dp(`(?i)api[_]?(?:url|endpoint|host|root|server|origin)['"]?\s*[=:]\s*['"]`+baseAbs+`['"]`, 300, nil,
+		"api_url", "apiurl", "api_endpoint", "apiendpoint", "api_host", "apihost", "api_root", "apiroot",
+		"api_server", "apiserver", "api_origin", "apiorigin"),
+	dp(`(?i)root[_]?url['"]?\s*[=:]\s*['"]`+baseAbs+`['"]`, 300, nil, "root_url", "rooturl"),
+	dp(`(?i)(?:server|backend|service)[_]?url['"]?\s*[=:]\s*['"]`+baseAbs+`['"]`, 300, nil,
+		"server_url", "serverurl", "backend_url", "backendurl", "service_url", "serviceurl"),
+	dp(`(?i)(?:VUE_APP|REACT_APP|NEXT_PUBLIC|VITE)(?:_PUBLIC)?_?(?:API_?BASE_?URL|API_?URL|API_?BASE|API_?ENDPOINT|BACKEND_?URL)['"]?\s*[=:]\s*['"]`+baseAbs+`['"]`, 300, nil,
+		"vue_app", "react_app", "next_public", "vite"),
+	dp(`process\.env\.\w+\s*\|\|\s*['"]`+baseAbs+`['"]`, 300, nil, "process.env"),
+	dp(`(?i)(?:host|origin|domain|endpoint)['"]?\s*[=:]\s*['"]`+baseAbs+`['"]`, 300, keyBoundary,
+		"host", "origin", "domain", "endpoint"),
 }
 
 var noisyHosts = []string{
@@ -386,6 +263,14 @@ var noisyHosts = []string{
 	"analytics", "tracking", "doubleclick", "google-analytics",
 	"stripe.com", "paypal.com", "facebook.com", "twitter.com",
 	"amazonaws.com", "cloudfront.net", "fastly.net", "akamai",
+	"w3.org", "schemas.", "xmlsoap.org", "openxmlformats.org",
+	// host dev/contoh tidak pernah jadi base aplikasi (bundle sering memuat
+	// sisa "http://localhost:80/..." -> dulu semua path ditempel ke localhost)
+	"localhost", "127.0.0.1", "0.0.0.0", "example.org", "example.net",
+	// situs pihak ketiga yang sering ditautkan berulang di bundle
+	"github.com", "githubusercontent.com", "gitlab.com", "google.com", "gstatic.com",
+	"youtube.com", "instagram.com", "linkedin.com", "pinterest.com", "wikipedia.org",
+	"mozilla.org", "npmjs.", "momentjs.com", "apple.com", "microsoft.com", "atlassian.net",
 }
 
 func isNoisyHost(host string) bool {
@@ -401,15 +286,12 @@ func isNoisyHost(host string) bool {
 var reAbsoluteURL = regexp.MustCompile(`https?://([a-zA-Z0-9\-\.]+(?::[0-9]+)?)(?:/[^\s'"` + "`" + `<>(){}|\\^]*)`)
 
 // pageLikeExtensions: URL halaman frontend / aset — tidak pernah valid
-// sebagai API base.
-// BUGFIX binus-2026-09: deklarasi MoreServiceUrl="https://host/LoginAD.php"
-// sempat jadi effectiveBase (lengkap dgn path); filter external lalu membuang
-// URL API absolut di sibling subdomain (api.apps.binus.ac.id). Kandidat
-// begini di-skip agar deteksi jatuh ke majority-vote / origin.
-var pageLikeExtensions = []string{
-	".php", ".aspx", ".ashx", ".asmx", ".jsp", ".jspx", ".do", ".action",
-	".html", ".htm", ".xhtml", ".js", ".jsx", ".ts", ".css", ".less", ".scss",
-	".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".woff", ".woff2",
+// sebagai API base (binus-2026-09: MoreServiceUrl=".../LoginAD.php").
+var pageLikeExtensions = map[string]bool{
+	".php": true, ".aspx": true, ".ashx": true, ".asmx": true, ".jsp": true, ".jspx": true,
+	".do": true, ".action": true, ".html": true, ".htm": true, ".xhtml": true, ".js": true,
+	".jsx": true, ".ts": true, ".css": true, ".less": true, ".scss": true, ".png": true,
+	".jpg": true, ".jpeg": true, ".gif": true, ".svg": true, ".ico": true, ".woff": true, ".woff2": true,
 }
 
 func isPageLikeURL(rawURL string) bool {
@@ -417,45 +299,70 @@ func isPageLikeURL(rawURL string) bool {
 	if err != nil || u.Path == "" || u.Path == "/" {
 		return false
 	}
-	last := u.Path
-	if i := strings.LastIndex(last, "/"); i >= 0 {
-		last = last[i+1:]
-	}
-	if i := strings.IndexAny(last, "?#"); i >= 0 {
-		last = last[:i]
-	}
-	dot := strings.LastIndex(last, ".")
-	if dot <= 0 || dot == len(last)-1 {
-		return false
-	}
-	ext := strings.ToLower(last[dot:])
-	for _, e := range pageLikeExtensions {
-		if ext == e {
-			return true
-		}
-	}
-	return false
+	return pageLikeExtensions[strings.ToLower(path.Ext(u.Path))]
 }
 
-func detectBaseURL(content, jsURL string) string {
-	for _, pat := range baseURLDeclarations {
-		if m := pat.FindStringSubmatch(content); len(m) > 1 {
-			candidate := strings.TrimSpace(m[1])
-			candidate = strings.TrimRight(candidate, "/")
-			if candidate == "" || isNoisyHost(extractHost(candidate)) {
+type baseCand struct {
+	pos int
+	url string
+}
+
+// detectDeclaredBase: deklarasi base eksplisit. Semua kandidat dikumpulkan
+// lalu dipilih: dgn scope -> kandidat in-scope pertama (SDK pihak ketiga
+// dgn baseURL sendiri TIDAK lagi membajak path relatif aplikasi); tanpa scope
+// -> utamakan registrable domain sama dgn halaman, else kandidat pertama.
+func detectDeclaredBase(content, lower, pageURL string, inScope func(string) bool) string {
+	var cands []baseCand
+	pageOrigin := originOf(pageURL)
+	for _, d := range baseDecls {
+		starts := anchorStarts(lower, d.anchors, func(p int) int { return p })
+		for _, m := range anchoredFind(content, d.re, starts, d.maxLen, d.pre) {
+			v := strings.TrimRight(strings.TrimSpace(content[m[2]:m[3]]), "/")
+			if v == "" {
 				continue
 			}
-			if isPageLikeURL(candidate) {
-				continue // URL halaman frontend — bukan API base
+			if strings.HasPrefix(v, "/") {
+				if pageOrigin == "" || !apiShapedEP(v+"/") {
+					continue // base relatif hanya bila beraroma API (/api, /v1, ...)
+				}
+				v = pageOrigin + v
 			}
-			return candidate
+			h := extractHost(v)
+			if h == "" || isNoisyHost(h) || isPageLikeURL(v) {
+				continue
+			}
+			cands = append(cands, baseCand{m[0], v})
 		}
 	}
+	if len(cands) == 0 {
+		return ""
+	}
+	sort.SliceStable(cands, func(i, j int) bool { return cands[i].pos < cands[j].pos })
+	if inScope != nil {
+		for _, c := range cands {
+			if inScope(extractHost(c.url)) {
+				return c.url
+			}
+		}
+		return ""
+	}
+	if ph := extractHost(pageURL); ph != "" {
+		rp := registrableDomain(ph)
+		for _, c := range cands {
+			if registrableDomain(extractHost(c.url)) == rp {
+				return c.url
+			}
+		}
+	}
+	return cands[0].url
+}
 
-	// Absolute URLs must NOT hijack the base on weak signal: require >=3
-	// DISTINCT absolute URLs to a host and score >= 5 (distinct +2 bonus
-	// if any has API path). 1-2 stray absolute links (docs, examples)
-	// keep page-origin resolution. Hosts iterated sorted for determinism.
+// detectElectedBase: voting URL absolut — butuh >=3 URL BERBEDA ke satu host
+// dan skor >=5 (+2 bila ada path API). Host di-iterasi terurut (deterministik).
+func detectElectedBase(content string, inScope func(string) bool) string {
+	if !strings.Contains(content, "://") {
+		return ""
+	}
 	seenURLs := make(map[string]map[string]bool)
 	hostScheme := make(map[string]string)
 	hostHasAPI := make(map[string]bool)
@@ -464,20 +371,15 @@ func detectBaseURL(content, jsURL string) string {
 		if isNoisyHost(host) {
 			continue
 		}
+		if inScope != nil && !inScope(strings.Split(host, ":")[0]) {
+			continue
+		}
 		fullURL := m[0]
 		if seenURLs[host] == nil {
 			seenURLs[host] = make(map[string]bool)
 		}
 		seenURLs[host][fullURL] = true
-		lower := strings.ToLower(fullURL)
-		if strings.Contains(lower, "/api") ||
-			strings.Contains(lower, "/v1") ||
-			strings.Contains(lower, "/v2") ||
-			strings.Contains(lower, "/v3") ||
-			strings.Contains(lower, "/auth") ||
-			strings.Contains(lower, "/graphql") ||
-			strings.Contains(lower, "/rest") ||
-			strings.Contains(lower, "/rpc") {
+		if apiShapedEP(fullURL) {
 			hostHasAPI[host] = true
 		}
 		if strings.HasPrefix(fullURL, "https://") {
@@ -486,7 +388,6 @@ func detectBaseURL(content, jsURL string) string {
 			hostScheme[host] = "http"
 		}
 	}
-
 	var hosts []string
 	for host := range seenURLs {
 		hosts = append(hosts, host)
@@ -499,34 +400,40 @@ func detectBaseURL(content, jsURL string) string {
 		if hostHasAPI[host] {
 			score += 2
 		}
-		if score > bestScore && len(seenURLs[host]) >= 3 && score >= 5 {
+		// wajib ada path API: link dokumentasi/sosmed berulang bukan base API
+		if hostHasAPI[host] && score > bestScore && len(seenURLs[host]) >= 3 && score >= 5 {
 			bestScore = score
 			bestHost = host
 		}
 	}
-	if bestHost != "" {
-		scheme := hostScheme[bestHost]
-		if scheme == "" {
-			scheme = "https"
-		}
-		return scheme + "://" + bestHost
+	if bestHost == "" {
+		return ""
 	}
+	return hostScheme[bestHost] + "://" + bestHost
+}
 
+// detectBaseURL (kompat): base efektif sebuah konten JS.
+func detectBaseURL(content, jsURL string) string {
+	if b := detectDeclaredBase(content, asciiLower(content), jsURL, nil); b != "" {
+		return b
+	}
+	if b := detectElectedBase(content, nil); b != "" {
+		return b
+	}
 	return originOf(jsURL)
 }
 
 func originOf(rawURL string) string {
 	u, err := url.Parse(rawURL)
-	if err != nil || u.Host == "" {
+	if err != nil || u.Host == "" || u.Scheme == "" {
 		return ""
 	}
-	return u.Scheme + "://" + u.Host
+	return strings.ToLower(u.Scheme) + "://" + u.Host
 }
 
 // ─── URL Resolver ─────────────────────────────────────────────────────────────
 
-// apiShapedEP: relatif beraroma API (selaras sinyal hostHasAPI di detectBaseURL).
-// Dipakai memutuskan apakah leading-/ boleh ikut elected base.
+// apiShapedEP: relatif beraroma API.
 func apiShapedEP(raw string) bool {
 	l := strings.ToLower(raw)
 	for _, k := range []string{"/api/", "/api?", "/v1", "/v2", "/v3", "/v4",
@@ -535,114 +442,279 @@ func apiShapedEP(raw string) bool {
 			return true
 		}
 	}
-	return false
+	return strings.HasSuffix(l, "/api")
 }
 
-// hasBaseDeclaration: file mendeklarasikan API base eksplisit (axios.create,
-// baseURL=, API_BASE=, ...). Sinyal STRUKTURAL (client menarget base itu) —
-// lebih kuat dari voting statistik; relatif file tsb ikut base deklarasi.
-func hasBaseDeclaration(content string) bool {
-	for _, pat := range baseURLDeclarations {
-		if pat.MatchString(content) {
+func fixBraces(s string) string {
+	if strings.Contains(s, "%7") || strings.Contains(s, "%5") {
+		s = strings.NewReplacer("%7B", "{", "%7D", "}", "%7b", "{", "%7d", "}", "%5B", "[", "%5D", "]").Replace(s)
+	}
+	return s
+}
+
+// resolveAgainst: resolusi RFC 3986 (semantik browser).
+func resolveAgainst(base, raw string) string {
+	bu, err := url.Parse(base)
+	if err != nil || bu.Host == "" {
+		return raw
+	}
+	ref, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return fixBraces(bu.ResolveReference(ref).String())
+}
+
+// cleanAbs: validasi URL absolut + bersihkan dot-segment (/a/../b).
+func cleanAbs(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || strings.ContainsAny(u.Host, "{}$") {
+		return ""
+	}
+	if strings.Contains(u.Path, "/.") {
+		ref := *u
+		ref.Scheme, ref.Host, ref.User = "", "", nil
+		base := &url.URL{Scheme: u.Scheme, Host: u.Host, User: u.User}
+		return fixBraces(base.ResolveReference(&ref).String())
+	}
+	return raw
+}
+
+// rootify: path relatif di JS -> relatif root dokumen ("./a", "../a", "a" -> "/a").
+func rootify(raw string) string {
+	if strings.HasPrefix(raw, "/") {
+		return raw
+	}
+	for {
+		switch {
+		case strings.HasPrefix(raw, "./"):
+			raw = raw[2:]
+		case strings.HasPrefix(raw, "../"):
+			raw = raw[3:]
+		default:
+			return "/" + raw
+		}
+	}
+}
+
+// joinBase: semantik axios (baseURL + url) untuk base deklarasi ber-path API.
+// Path yang sudah memuat prefix base (/api/...) ditempel ke origin saja.
+func joinBase(base, raw string) string {
+	bu, err := url.Parse(base)
+	if err != nil || bu.Host == "" {
+		return resolveAgainst(base, rootify(raw))
+	}
+	origin := bu.Scheme + "://" + bu.Host
+	bp := strings.TrimRight(bu.Path, "/")
+	if strings.HasPrefix(raw, "./") || strings.HasPrefix(raw, "../") {
+		return resolveAgainst(origin+bp+"/", raw)
+	}
+	r := rootify(raw)
+	if bp == "" || !apiShapedEP(bp+"/") {
+		return resolveAgainst(origin, r)
+	}
+	first := bp
+	if i := strings.IndexByte(bp[1:], '/'); i >= 0 {
+		first = bp[:i+1]
+	}
+	if r == bp || r == first || strings.HasPrefix(r, bp+"/") || strings.HasPrefix(r, first+"/") || strings.Contains(r, bp+"/") {
+		return resolveAgainst(origin, r)
+	}
+	return resolveAgainst(origin, bp+r)
+}
+
+// resolveURL (kompat): resolusi sederhana raw terhadap base/jsURL.
+func resolveURL(raw, jsURL, baseOverride string) string {
+	raw = normaliseTemplateURL(strings.TrimSpace(raw))
+	if reSchemeEP.MatchString(raw) {
+		return cleanAbs(raw)
+	}
+	base := baseOverride
+	if base == "" {
+		base = jsURL
+	}
+	if strings.HasPrefix(raw, "//") {
+		scheme := "https"
+		if bu, err := url.Parse(base); err == nil && bu.Scheme != "" {
+			scheme = bu.Scheme
+		}
+		return scheme + ":" + raw
+	}
+	return resolveAgainst(base, raw)
+}
+
+// ─── Validasi kandidat ───────────────────────────────────────────────────────
+
+var sysPathPrefixes = []string{"/usr/", "/etc/", "/var/", "/opt/", "/bin/", "/sbin/", "/tmp/", "/dev/", "/proc/", "/sys/", "/lib/", "/home/", "/root/", "/mnt/", "/data/", "/private/var/", "/Users/", "/node_modules/", "/webpack/"}
+
+// randomSeg: segmen acak bundle minified (hash/base64): >=16 char,
+// huruf besar+kecil+digit, tanpa pemisah.
+func randomSeg(seg string) bool {
+	if len(seg) < 16 || strings.ContainsAny(seg, "-_.~{}:") {
+		return false
+	}
+	var up, lo, dg bool
+	for i := 0; i < len(seg); i++ {
+		c := seg[i]
+		switch {
+		case c >= 'A' && c <= 'Z':
+			up = true
+		case c >= 'a' && c <= 'z':
+			lo = true
+		case c >= '0' && c <= '9':
+			dg = true
+		}
+	}
+	return up && lo && dg
+}
+
+// literalSegment: minimal satu segmen path berisi nama (bukan cuma {x}/:x/angka).
+func literalSegment(p string) bool {
+	if i := strings.IndexAny(p, "?#"); i >= 0 {
+		p = p[:i]
+	}
+	for _, seg := range strings.Split(p, "/") {
+		if seg == "" || strings.HasPrefix(seg, "{") || strings.HasPrefix(seg, ":") || strings.HasPrefix(seg, "[") {
+			continue
+		}
+		if hasLetter(seg) {
 			return true
 		}
 	}
 	return false
 }
 
-func resolveURL(raw, jsURL, baseOverride string) string {
-	raw = strings.TrimSpace(raw)
-	raw = normaliseTemplateURL(raw)
-
-	if strings.HasPrefix(raw, "http://") || strings.HasPrefix(raw, "https://") {
-		return raw
-	}
-	if strings.HasPrefix(raw, "//") {
-		scheme := "https"
-		base := baseOverride
-		if base == "" {
-			base = jsURL
+// validGenericPathEP: saringan FP utk literal generik ("/..." apa saja).
+func validGenericPathEP(raw string) bool {
+	for _, p := range sysPathPrefixes {
+		if strings.HasPrefix(raw, p) {
+			return false
 		}
-		if bu, err := url.Parse(base); err == nil && bu.Scheme != "" {
-			scheme = bu.Scheme
+	}
+	if strings.HasPrefix(raw, "//") && !strings.Contains(raw[2:], "/") {
+		return false
+	}
+	if !literalSegment(raw) {
+		return false // tanggal "/2024/01/02", versi, "/{e}"
+	}
+	p := raw
+	if i := strings.IndexAny(p, "?#"); i >= 0 {
+		p = p[:i]
+	}
+	for _, seg := range strings.Split(p, "/") {
+		if randomSeg(seg) {
+			return false
 		}
-		return scheme + ":" + raw
 	}
-
-	base := baseOverride
-	if base == "" {
-		base = jsURL
+	// regex / glob literal: "/^\/api/", "/.*", "/**/*.js"
+	if strings.ContainsAny(raw, "^|") || strings.Contains(raw, ".*") || strings.Contains(raw, "**") {
+		return false
 	}
-	baseU, err := url.Parse(base)
-	if err != nil || baseU.Host == "" {
-		return raw
+	// karakter kode di bagian PATH ("/},{begin:/", "/a,b(c)") — placeholder
+	// {name} dan :param* tetap boleh
+	pp := rePlaceholderSeg.ReplaceAllString(p, "")
+	pp = strings.ReplaceAll(pp, "*", "")          // :path*
+	if strings.ContainsAny(pp, ",{}();!'\"<>`") { // $ boleh: OData /$batch
+		return false
 	}
-	ref, err := url.Parse(raw)
-	if err != nil {
-		return raw
-	}
-	resolved := baseU.ResolveReference(ref)
-	result := resolved.String()
-	result = strings.ReplaceAll(result, "%7B", "{")
-	result = strings.ReplaceAll(result, "%7D", "}")
-	return result
+	return true
 }
 
-// ─── Known URL Normalisation ──────────────────────────────────────────────────
+var (
+	rePlaceholderSeg = regexp.MustCompile(`\{[A-Za-z_][A-Za-z0-9_]*\}`)
+	reRegexFlagsTail = regexp.MustCompile(`^/[^/]+(?:/[^/]*)*/(?:[dgimsuy]{1,6}|[dgimsuy]{0,6}\.(?:test|exec|source|flags))$`)
+)
 
-// validGenericPathEP: tolak filesystem-path palsu (/usr/bin/...) agar
-// generic-quoted-path tak banjir FP. Sys-prefix = bukan endpoint web.
-func validGenericPathEP(raw string) bool {
-	for _, p := range []string{"/usr/", "/etc/", "/var/", "/opt/", "/bin/", "/sbin/", "/tmp/", "/dev/", "/proc/", "/sys/", "/lib/", "/home/", "/root/", "/mnt/", "/data/"} {
-		if strings.HasPrefix(raw, p) {
+// validBarePath: path tanpa quote (prosa/komentar). Tolak bentuk regex
+// literal /Android/i, /a/gim, /%20/g (umum di bundle minified).
+func validBarePath(raw string) bool {
+	if reRegexFlagsTail.MatchString(raw) {
+		return false
+	}
+	return validGenericPathEP(raw)
+}
+
+// validPathOrURL: wajib path/URL (mengandung '/').
+func validPathOrURL(raw string) bool {
+	return strings.Contains(raw, "/") && validLooseRelative(raw)
+}
+
+// validLooseRelative: relatif tanpa slash boleh, tapi bukan MIME, header,
+// kata ber-spasi, atau tanpa huruf.
+func validLooseRelative(raw string) bool {
+	if !hasLetter(raw) || reMimeLike.MatchString(raw) {
+		return false
+	}
+	if !strings.Contains(raw, "/") {
+		// "Content-Type", "cache-key:1"? kata tunggal hanya bila lowercase path-ish
+		for i := 0; i < len(raw); i++ {
+			if raw[i] >= 'A' && raw[i] <= 'Z' {
+				return false
+			}
+		}
+		if strings.ContainsAny(raw, ":;,=") {
 			return false
 		}
 	}
 	return true
 }
 
-func normaliseForFilter(rawURL string) string {
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return strings.ToLower(strings.TrimRight(rawURL, "/"))
+// validCandidate: saringan umum utk semua pola (setelah normalisasi template).
+func validCandidate(raw string, kind patKind) bool {
+	if raw == "" || strings.ContainsAny(raw, " \\\t\n") || strings.HasPrefix(raw, "#") {
+		return false
 	}
-	p := u.EscapedPath()
-	if p == "" {
-		p = "/"
+	if reSchemeEP.MatchString(raw) || strings.HasPrefix(raw, "//") {
+		return true // skema dicek saat resolusi
 	}
-	p = strings.TrimRight(p, "/")
-	if p == "" {
-		p = "/"
+	if !literalSegment(raw) {
+		return false
 	}
-	result := strings.ToLower(u.Hostname()) + p
-	return result
+	if !strings.HasPrefix(raw, "/") && kind != kHTML && kind != kModule {
+		// relatif tanpa slash: tolak MIME/tanggal/versi/kunci i18n
+		if reMimeLike.MatchString(raw) || !hasLetter(raw) {
+			return false
+		}
+		if !strings.Contains(raw, "/") && strings.Contains(raw, ".") && !isStaticExt("/"+raw) {
+			switch strings.ToLower(path.Ext(raw)) {
+			case ".json", ".php", ".aspx", ".jsp", ".do", ".html", ".htm", ".xml", ".txt":
+			default:
+				return false // "errors.not_found", "a.b.c"
+			}
+		}
+	}
+	return true
 }
 
-// ─── lineIndex (v2) ────────────────────────────────────────────────────────────
+var nextInternalPages = map[string]bool{"/_app": true, "/_document": true, "/_error": true}
+
+// ─── lineIndex ────────────────────────────────────────────────────────────────
 
 type lineIndex struct{ starts []int }
 
 func buildLineIndex(content string) *lineIndex {
 	starts := []int{0}
-	for i := 0; i < len(content); i++ {
-		if content[i] == '\n' {
-			starts = append(starts, i+1)
+	for i := 0; i < len(content); {
+		j := strings.IndexByte(content[i:], '\n')
+		if j < 0 {
+			break
 		}
+		i += j + 1
+		starts = append(starts, i)
 	}
 	return &lineIndex{starts: starts}
 }
 
 func (li *lineIndex) lineAt(pos int) int {
-	lo, hi := 0, len(li.starts)-1
-	for lo < hi {
-		mid := (lo + hi + 1) / 2
-		if li.starts[mid] <= pos {
-			lo = mid
-		} else {
-			hi = mid - 1
-		}
+	return sort.Search(len(li.starts), func(i int) bool { return li.starts[i] > pos })
+}
+
+func (li *lineIndex) lineCol(pos int) (int, int) {
+	l := li.lineAt(pos)
+	if l < 1 {
+		return 1, pos + 1
 	}
-	return lo + 1
+	return l, pos - li.starts[l-1] + 1
 }
 
 // validHTTPMethod: only real verbs pass; router "USE"/"ALL" etc fall back to DefaultMethod.
@@ -654,33 +726,59 @@ func validHTTPMethod(m string) bool {
 	return false
 }
 
-// ─── Core Extractor (v2: whole-content scan + char-window context) ─────────────
+// ─── Atribusi method via variabel (fetch(VAR,{method}) / axios.post(VAR)) ─────
 
-const ctxWindow = 500 // char di kiri/kanan match untuk ekstraksi param
+var reVarAssignAnch = regexp.MustCompile(`^([A-Za-z_$][A-Za-z0-9_$]{0,63})\s*[=:]\s*["'](https?://[^'"` + "`" + `\s<>(){}|\\^]+)["']`)
 
-// reVarAssign: `NAME="https://..."` / `NAME:'...'` / `NAME:...` — deklarasi
-// URL absolut ke variabel/properti. Value wajib absolut (presisi tinggi).
-// BUGFIX binus-2026-09: endpoint hasil deklarasi bare-string selalu
-// berlabel DefaultMethod (GET) walau call-site memakai POST.
-var reVarAssign = regexp.MustCompile(`[\s,{(;]([A-Za-z_$][A-Za-z0-9_$]{0,63})\s*[=:]\s*["'](https?://[^'"` + "`" + `\s<>(){}|\\^]+)["']`)
+var (
+	reVarFetchM    = regexp.MustCompile(`fetch\s*\(\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*,\s*\{[^}]{0,400}method\s*:\s*['"]([A-Za-z]+)['"]`)
+	reVarAxiosM    = regexp.MustCompile(`axios\s*\.\s*(get|post|put|delete|patch|head|options)\s*\(\s*([A-Za-z_$][A-Za-z0-9_$]*)`)
+	reVarAxiosCfg1 = regexp.MustCompile(`axios\s*\(\s*\{[^}]{0,300}url\s*:\s*([A-Za-z_$][A-Za-z0-9_$]*)[^}]{0,300}method\s*:\s*['"]([A-Za-z]+)['"]`)
+	reVarAxiosCfg2 = regexp.MustCompile(`axios\s*\(\s*\{[^}]{0,300}method\s*:\s*['"]([A-Za-z]+)['"]\s*,[^}]{0,300}url\s*:\s*([A-Za-z_$][A-Za-z0-9_$]*)`)
+	reVarAjax      = regexp.MustCompile(`\$\.ajax\s*\(\s*\{[^}]{0,300}url\s*:\s*([A-Za-z_$][A-Za-z0-9_$]*)[^}]{0,300}(?:method|type)\s*:\s*['"]([A-Za-z]+)['"]`)
+	reVarJQ        = regexp.MustCompile(`\$\.(get|post)\s*\(\s*([A-Za-z_$][A-Za-z0-9_$]*)`)
+	reVarXHR       = regexp.MustCompile(`\.open\s*\(\s*['"]([A-Za-z]+)['"]\s*,\s*([A-Za-z_$][A-Za-z0-9_$]*)`)
+)
 
 // collectVarURLs: namaVar(lower) -> URL absolut (first wins).
+// Kandidat dicari dari `"http` / `'http`, mundur ke `NAME =|:`.
 func collectVarURLs(content string) map[string]string {
 	out := map[string]string{}
-	for _, m := range reVarAssign.FindAllStringSubmatch(content, -1) {
-		if len(m) < 3 {
-			continue
+	if !strings.Contains(content, "://") {
+		return out
+	}
+	start := func(p int) int {
+		i := p - 1
+		for i >= 0 && isWSByte(content[i]) {
+			i--
 		}
-		k := strings.ToLower(m[1])
+		if i < 0 || (content[i] != '=' && content[i] != ':') {
+			return -1
+		}
+		i--
+		for i >= 0 && isWSByte(content[i]) {
+			i--
+		}
+		j := i
+		for j >= 0 && isIdentByte(content[j]) {
+			j--
+		}
+		if j == i || j < 0 || strings.IndexByte(" \t\n\r,{(;", content[j]) < 0 {
+			return -1
+		}
+		return j + 1
+	}
+	starts := anchorStarts(content, []string{`"http`, `'http`}, start)
+	for _, m := range anchoredFind(content, reVarAssignAnch, starts, 2200, nil) {
+		k := strings.ToLower(content[m[2]:m[3]])
 		if _, ok := out[k]; !ok {
-			out[k] = m[2]
+			out[k] = content[m[4]:m[5]]
 		}
 	}
 	return out
 }
 
-// resolveVarCallMethods: hubungkan call-site fetch(VAR,...)/axios -> method
-// eksplisit. absURL(lower) -> METHOD. Prefer non-GET saat konflik.
+// resolveVarCallMethods: absURL(lower) -> METHOD. Prefer non-GET saat konflik.
 func resolveVarCallMethods(content string, varURLs map[string]string) map[string]string {
 	out := map[string]string{}
 	if len(varURLs) == 0 {
@@ -700,438 +798,509 @@ func resolveVarCallMethods(content string, varURLs map[string]string) map[string
 			out[k] = method
 		}
 	}
-	// fetch(VAR, {method:"POST",...}) — options chunk dibatasi, method
-	// biasanya mendahului nested headers:{...}
-	for _, m := range regexp.MustCompile(`fetch\s*\(\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*,\s*\{[^}]{0,400}method\s*:\s*['"]([A-Za-z]+)['"]`).FindAllStringSubmatch(content, -1) {
-		if len(m) >= 3 {
-			put(m[1], m[2])
-		}
+	type spec struct {
+		re         *regexp.Regexp
+		varG, mthG int
+		need       string
 	}
-	// axios.get|post|...(VAR)
-	for _, m := range regexp.MustCompile(`axios\s*\.\s*(get|post|put|delete|patch|head|options)\s*\(\s*([A-Za-z_$][A-Za-z0-9_$]*)`).FindAllStringSubmatch(content, -1) {
-		if len(m) >= 3 {
-			put(m[2], m[1])
+	for _, sp := range []spec{
+		{reVarFetchM, 1, 2, "fetch"}, {reVarAxiosM, 2, 1, "axios"}, {reVarAxiosCfg1, 1, 2, "axios"},
+		{reVarAxiosCfg2, 2, 1, "axios"}, {reVarAjax, 1, 2, "$.ajax"}, {reVarJQ, 2, 1, "$."}, {reVarXHR, 2, 1, ".open"},
+	} {
+		if !strings.Contains(content, sp.need) {
+			continue
 		}
-	}
-	// axios({url:VAR, method:"POST"}) & urutan terbalik
-	for _, m := range regexp.MustCompile(`axios\s*\(\s*\{[^}]{0,300}url\s*:\s*([A-Za-z_$][A-Za-z0-9_$]*)[^}]{0,300}method\s*:\s*['"]([A-Za-z]+)['"]`).FindAllStringSubmatch(content, -1) {
-		if len(m) >= 3 {
-			put(m[1], m[2])
-		}
-	}
-	for _, m := range regexp.MustCompile(`axios\s*\(\s*\{[^}]{0,300}method\s*:\s*['"]([A-Za-z]+)['"]\s*,[^}]{0,300}url\s*:\s*([A-Za-z_$][A-Za-z0-9_$]*)`).FindAllStringSubmatch(content, -1) {
-		if len(m) >= 3 {
-			put(m[2], m[1])
-		}
-	}
-	// $.ajax({url:VAR, method/type:"POST"})
-	for _, m := range regexp.MustCompile(`\$\.ajax\s*\(\s*\{[^}]{0,300}url\s*:\s*([A-Za-z_$][A-Za-z0-9_$]*)[^}]{0,300}(?:method|type)\s*:\s*['"]([A-Za-z]+)['"]`).FindAllStringSubmatch(content, -1) {
-		if len(m) >= 3 {
-			put(m[1], m[2])
-		}
-	}
-	// $.get|post(VAR)
-	for _, m := range regexp.MustCompile(`\$\.(get|post)\s*\(\s*([A-Za-z_$][A-Za-z0-9_$]*)`).FindAllStringSubmatch(content, -1) {
-		if len(m) >= 3 {
-			put(m[2], m[1])
-		}
-	}
-	// xhr.open("POST", VAR)
-	for _, m := range regexp.MustCompile(`\.open\s*\(\s*['"]([A-Za-z]+)['"]\s*,\s*([A-Za-z_$][A-Za-z0-9_$]*)`).FindAllStringSubmatch(content, -1) {
-		if len(m) >= 3 {
-			put(m[2], m[1])
+		for _, m := range sp.re.FindAllStringSubmatch(content, -1) {
+			put(m[sp.varG], m[sp.mthG])
 		}
 	}
 	return out
 }
 
-// ─── Pra-ekstraksi: normalisasi bundle obfuscated ────────────────────────────
-// Urutan: unescape -> join-concat -> array-join -> propagasi var (loop s.d stabil,
-// maks 3). Semua transformasi preservasi-semantik (single-assignment only) dan
-// preservasi-newline, sehingga nomor baris temuan tetap valid.
-func unescapeEP(s string) string {
-	s = reHexEscEP.ReplaceAllStringFunc(s, func(m string) string {
-		if len(m) < 4 {
-			return m
+// ─── Core Extractor ───────────────────────────────────────────────────────────
+
+type contentKind int
+
+const (
+	ckJS contentKind = iota
+	ckJSON
+	ckHTML
+)
+
+func detectContentKind(ctype, pageURL, content string) contentKind {
+	ct := strings.ToLower(ctype)
+	switch {
+	case strings.Contains(ct, "html"):
+		return ckHTML
+	case strings.Contains(ct, "json"):
+		return ckJSON
+	case strings.Contains(ct, "javascript") || strings.Contains(ct, "ecmascript"):
+		return ckJS
+	}
+	head := content
+	if len(head) > 1024 {
+		head = head[:1024]
+	}
+	h := strings.ToLower(strings.TrimSpace(head))
+	if strings.HasPrefix(h, "<!doctype html") || strings.HasPrefix(h, "<html") ||
+		(strings.HasPrefix(h, "<") && (strings.Contains(h, "<head") || strings.Contains(h, "<body") || strings.Contains(h, "<script"))) {
+		return ckHTML
+	}
+	if strings.HasPrefix(h, "{") || strings.HasPrefix(h, "[") {
+		if strings.HasSuffix(strings.ToLower(pathOf(pageURL)), ".js") {
+			return ckJS
 		}
-		v, err := strconv.ParseUint(m[2:4], 16, 8)
-		if err != nil {
-			return m
-		}
-		return string(rune(v))
-	})
-	return reUniEscEP.ReplaceAllStringFunc(s, func(m string) string {
-		if len(m) < 6 {
-			return m
-		}
-		v, err := strconv.ParseUint(m[2:6], 16, 16)
-		if err != nil || (v >= 0xD800 && v <= 0xDFFF) {
-			return m
-		}
-		return string(rune(v))
-	})
+		return ckJSON
+	}
+	return ckJS
 }
 
-func joinConcatEP(s string) string {
-	for i := 0; i < 5; i++ {
-		n := reConcatDQEP.ReplaceAllString(s, `"$1$2"`)
-		n = reConcatSQEP.ReplaceAllString(n, `'$1$2'`)
-		if n == s {
-			break
-		}
-		s = n
-	}
-	return s
+func isYAML(ctype, pageURL string) bool {
+	p := strings.ToLower(pathOf(pageURL))
+	return strings.Contains(strings.ToLower(ctype), "yaml") || strings.HasSuffix(p, ".yaml") || strings.HasSuffix(p, ".yml")
 }
 
-func evalArrJoinEP(s string) string {
-	return reArrJoinEP.ReplaceAllStringFunc(s, func(m string) string {
-		ji := strings.LastIndex(m, ".join(")
-		if ji < 0 {
-			return m
-		}
-		tail := m[ji+len(".join("):]
-		sep := ""
-		if strings.HasPrefix(tail, `"`) || strings.HasPrefix(tail, `'`) {
-			q := tail[:1]
-			end := strings.Index(tail[1:], q)
-			if end < 0 {
-				return m
-			}
-			sep = tail[1 : 1+end]
-			if sep != "/" && sep != "" {
-				return m
-			}
-		} else {
-			return m
-		}
-		riend := strings.LastIndex(m[:ji], "]")
-		if riend < 0 {
-			return m
-		}
-		inner := m[1:riend]
-		parts := reQuotedEP.FindAllStringSubmatch(inner, -1)
-		if len(parts) == 0 {
-			return m
-		}
-		stripped := reQuotedEP.ReplaceAllString(inner, "")
-		if strings.Trim(stripped, " \t\n\r,") != "" {
-			return m
-		}
-		var elems []string
-		for _, p := range parts {
-			if p[1] != "" {
-				elems = append(elems, p[1])
-			} else {
-				elems = append(elems, p[2])
-			}
-		}
-		return `"` + strings.Join(elems, sep) + `"`
+func pathOf(raw string) string {
+	if u, err := url.Parse(raw); err == nil {
+		return u.Path
+	}
+	return raw
+}
+
+// ExtractOptions: parameter ekstraksi satu record.
+type ExtractOptions struct {
+	SourceLabel     string // label source (default PageURL)
+	PageURL         string // URL record (dasar resolusi)
+	BaseOverride    string // -b
+	ContentType     string
+	IncludeAssets   bool
+	IncludeExternal bool
+	InScope         func(host string) bool // nil = tanpa scope (hanya utk pemilihan base)
+}
+
+type ExtractResult struct {
+	Endpoints       []Endpoint
+	Base            string
+	SkippedExternal int
+	ScriptRefs      []string // <script src> absolut (record HTML)
+	DocOrigin       string   // origin dokumen efektif (HTML, setelah <base>)
+}
+
+type extractor struct {
+	o           ExtractOptions
+	ck          contentKind
+	orig        string
+	c           string
+	lower       string
+	nt          normText
+	li          *lineIndex
+	pageOrigin  string
+	docBase     string
+	declBase    string
+	electedBase string
+	effBase     string
+	varMethods  map[string]string
+	eps         []Endpoint
+	skippedExt  map[string]bool
+}
+
+func (x *extractor) lowerC() string {
+	if x.lower == "" && x.c != "" {
+		x.lower = asciiLower(x.c)
+	}
+	return x.lower
+}
+
+// extractEndpoints (kompat): API lama -> (endpoint, base efektif, jumlah external di-skip).
+func extractEndpoints(content, sourceURL, jsURL, baseOverride string, includeAssets, includeExternal bool) ([]Endpoint, string, int) {
+	r := Extract(content, ExtractOptions{
+		SourceLabel: sourceURL, PageURL: jsURL, BaseOverride: baseOverride,
+		IncludeAssets: includeAssets, IncludeExternal: includeExternal,
 	})
+	return r.Endpoints, r.Base, r.SkippedExternal
 }
 
-// propagateEP: one-hop constant propagation.
-// `var/let/const NAME="lit"` atau `,NAME="lit"` (koma-declarator, norma minified)
-// yang TEPAT SATU assignment -> semua use posisi-nilai (+ ${NAME}) di-inline.
-// Guard: shadowing (param/fungsi/loop/import/class), reassignment, shorthand {n},
-// key n:, comparison. Multi-use BOLEH (single-assignment => semua read sama).
-func propagateEP(s string) string {
-	if !(strings.Contains(s, "var ") || strings.Contains(s, "let ") || strings.Contains(s, "const ")) {
-		return s
+func Extract(content string, o ExtractOptions) ExtractResult {
+	if o.SourceLabel == "" {
+		o.SourceLabel = o.PageURL
 	}
-	type decl struct{ name, lit string }
-	var decls []decl
-	for _, loc := range reVarAssignEP.FindAllStringSubmatchIndex(s, -1) {
-		name := s[loc[2]:loc[3]]
-		lit := s[loc[4]:loc[5]]
-		decls = append(decls, decl{name, lit})
-	}
-	if len(decls) == 0 {
-		return s
-	}
-	isWS := func(c byte) bool { return c == ' ' || c == '\t' || c == '\n' || c == '\r' }
-	wordRe := func(name string) *regexp.Regexp {
-		return regexp.MustCompile(`\b` + regexp.QuoteMeta(name) + `\b`)
-	}
-	assignRe := func(name string) *regexp.Regexp {
-		return regexp.MustCompile(`\b` + regexp.QuoteMeta(name) + `\s*=`)
-	}
-	shadowed := func(name string) bool {
-		q := regexp.QuoteMeta(name)
-		pats := []string{
-			`function\s+` + q + `\b`,
-			`function\s*\([^)]*\b` + q + `\b`,
-			`\(\s*[^)]*\b` + q + `\b[^)]*\)\s*=>`,
-			`for\s*\(\s*(?:var|let|const)?\s*` + q + `\b`,
-			`catch\s*\(\s*` + q + `\b`,
-			`class\s+` + q + `\b`,
-			`import\s+[^;]*\b` + q + `\b`,
-		}
-		for _, p := range pats {
-			if regexp.MustCompile(p).MatchString(s) {
-				return true
+	x := &extractor{o: o, orig: content, skippedExt: map[string]bool{}}
+	x.ck = detectContentKind(o.ContentType, o.PageURL, content)
+	x.nt = normaliseContentEP(content, x.ck)
+	x.c = x.nt.s
+	x.pageOrigin = originOf(o.PageURL)
+	x.docBase = o.PageURL
+	var res ExtractResult
+
+	if x.ck == ckHTML {
+		if m := reBaseHref.FindStringSubmatch(x.c); m != nil {
+			if b := resolveAgainst(o.PageURL, strings.TrimSpace(m[1])); b != "" && extractHost(b) != "" {
+				x.docBase = b
 			}
 		}
+		res.DocOrigin = originOf(x.docBase)
+		for _, m := range reScriptSrc.FindAllStringSubmatch(x.c, -1) {
+			if r, _, _ := x.resolve(strings.TrimSpace(m[1]), kHTML); r != "" {
+				res.ScriptRefs = append(res.ScriptRefs, r)
+			}
+		}
+	}
+
+	if o.BaseOverride != "" {
+		x.effBase = o.BaseOverride
+	} else {
+		x.declBase = detectDeclaredBase(x.c, x.lowerC(), o.PageURL, o.InScope)
+		if x.declBase == "" {
+			x.electedBase = detectElectedBase(x.c, o.InScope)
+		}
+		switch {
+		case x.declBase != "":
+			x.effBase = x.declBase
+		case x.electedBase != "":
+			x.effBase = x.electedBase
+		case x.ck == ckHTML:
+			x.effBase = originOf(x.docBase)
+		default:
+			x.effBase = x.pageOrigin
+		}
+	}
+	x.varMethods = resolveVarCallMethods(x.c, collectVarURLs(x.c))
+	yaml := isYAML(o.ContentType, o.PageURL)
+
+	claimed := map[int]bool{}
+	for pi := range extractionPatterns {
+		pat := &extractionPatterns[pi]
+		if (pat.HTMLOnly && x.ck != ckHTML) || (pat.AssetOnly && !o.IncludeAssets) || (pat.YAMLOnly && !yaml) {
+			continue
+		}
+		for _, loc := range pat.findAll(x.c, x.lowerC) {
+			s, e := loc[pat.URLGroup*2], loc[pat.URLGroup*2+1]
+			if s < 0 || e < 0 || claimed[s] {
+				// literal yg sama sudah diklaim pola yang lebih spesifik
+				// (api.get("/x") jangan diulang generic-quoted-path ke origin lain)
+				continue
+			}
+			kind, args, validate := pat.Kind, pat.Args, pat.Validate
+			if pat.KeyGroup > 0 && loc[pat.KeyGroup*2] >= 0 {
+				if routeKeys[strings.ToLower(x.c[loc[pat.KeyGroup*2]:loc[pat.KeyGroup*2+1]])] {
+					kind = kRoute
+				}
+			}
+			method, explicit := "", false
+			if pat.MethodGroup > 0 && loc[pat.MethodGroup*2] >= 0 {
+				method = strings.ToUpper(x.c[loc[pat.MethodGroup*2]:loc[pat.MethodGroup*2+1]])
+				explicit = validHTTPMethod(method)
+				if !explicit {
+					method = ""
+				}
+			}
+			if pat.Receiver {
+				mc := classifyMember(x.c, loc[0], x.c[loc[pat.MethodGroup*2]:loc[pat.MethodGroup*2+1]], x.c[s:e])
+				if !mc.ok {
+					continue
+				}
+				kind, args, validate = mc.kind, mc.args, mc.validate
+			}
+			if pat.ForceMethod {
+				method, explicit = pat.DefaultMethod, true
+			}
+			if x.emit(pat, kind, args, validate, s, e, method, explicit) {
+				claimed[s] = true
+			}
+		}
+	}
+	if x.ck == ckHTML {
+		x.extractForms()
+	}
+
+	res.Endpoints = mergeEndpoints(sortByPos(x.eps))
+	res.Base = x.effBase
+	res.SkippedExternal = len(x.skippedExt)
+	return res
+}
+
+// extractForms: <form action method> (method atribut -> eksplisit).
+func (x *extractor) extractForms() {
+	pat := &ExtractionPattern{Name: "html-form", Kind: kHTML, DefaultMethod: "GET"}
+	for _, loc := range reFormTag.FindAllStringSubmatchIndex(x.c, -1) {
+		attrs := x.c[loc[2]:loc[3]]
+		am := reFormAction.FindStringSubmatchIndex(attrs)
+		if am == nil || am[3] <= am[2] {
+			continue
+		}
+		method, explicit := "", false
+		if mm := reFormMethod.FindStringSubmatch(attrs); mm != nil {
+			if m := strings.ToUpper(mm[1]); validHTTPMethod(m) {
+				method, explicit = m, true
+			}
+		}
+		x.emit(pat, kHTML, argNone, nil, loc[2]+am[2], loc[2]+am[3], method, explicit)
+	}
+}
+
+func sortByPos(eps []Endpoint) []Endpoint {
+	sort.SliceStable(eps, func(i, j int) bool { return eps[i].pos < eps[j].pos })
+	return eps
+}
+
+// resolve: raw -> (abs, pageRel, relPath). abs "" = ditolak.
+func (x *extractor) resolve(raw string, kind patKind) (string, bool, string) {
+	raw = normaliseTemplateURL(raw)
+	if raw == "" {
+		return "", false, ""
+	}
+	if sch := reSchemeEP.FindString(raw); sch != "" {
+		switch strings.ToLower(strings.TrimSuffix(sch, ":")) {
+		case "http", "https", "ws", "wss":
+			return cleanAbs(raw), false, ""
+		}
+		return "", false, "" // javascript:, mailto:, tel:, data:, blob:, ...
+	}
+	if strings.HasPrefix(raw, "//") {
+		b := x.o.BaseOverride
+		if b == "" {
+			b = x.o.PageURL
+		}
+		scheme := "https"
+		if bu, err := url.Parse(b); err == nil && bu.Scheme != "" {
+			scheme = bu.Scheme
+		}
+		return cleanAbs(scheme + ":" + raw), false, ""
+	}
+	if x.o.BaseOverride != "" {
+		return resolveAgainst(x.o.BaseOverride, raw), false, ""
+	}
+	if x.ck == ckHTML || kind == kHTML {
+		return resolveAgainst(x.docBase, raw), false, ""
+	}
+	if kind == kModule {
+		return resolveAgainst(x.o.PageURL, raw), false, ""
+	}
+	api := apiShapedEP(raw)
+	if x.declBase != "" && kind != kRoute && (kind == kInstance || api) {
+		return joinBase(x.declBase, raw), false, ""
+	}
+	if x.electedBase != "" && kind != kRoute && api {
+		return resolveAgainst(x.electedBase, rootify(raw)), false, ""
+	}
+	if x.pageOrigin == "" {
+		return raw, false, "" // file lokal tanpa -b: tetap relatif
+	}
+	rel := rootify(raw)
+	return resolveAgainst(x.pageOrigin, rel), true, rel
+}
+
+// htmlTagAt: nama tag HTML yang memuat offset pos (lowercase), "" bila tak ada.
+func htmlTagAt(c string, pos int) string {
+	from := pos - 2000
+	if from < 0 {
+		from = 0
+	}
+	lt := strings.LastIndexByte(c[from:pos], '<')
+	if lt < 0 {
+		return ""
+	}
+	lt += from
+	if strings.IndexByte(c[lt:pos], '>') >= 0 {
+		return ""
+	}
+	j := lt + 1
+	for j < len(c) && j < lt+20 && (isIdentByte(c[j]) || c[j] == '-') {
+		j++
+	}
+	return strings.ToLower(c[lt+1 : j])
+}
+
+// emit: proses satu kandidat; true bila endpoint dicatat.
+func (x *extractor) emit(pat *ExtractionPattern, kind patKind, args argStyle, validate func(string) bool, s, e int, method string, explicit bool) bool {
+	c := x.c
+	raw := strings.TrimSpace(c[s:e])
+	if len(raw) < 2 {
 		return false
 	}
-	cur := s
-	changed := false
-	for _, d := range decls {
-		if shadowed(d.name) {
-			continue
-		}
-		wr := wordRe(d.name)
-		ar := assignRe(d.name)
-		uses := wr.FindAllStringIndex(cur, -1)
-		assignCount := 0
-		for _, u := range uses {
-			tail := cur[u[0]:]
-			if m := ar.FindStringIndex(tail); m != nil && m[0] == 0 {
-				after := tail[m[1]:]
-				if len(after) > 0 && (after[0] == '=' || after[0] == '>') {
-					continue
-				}
-				assignCount++
-			}
-		}
-		if assignCount != 1 {
-			continue
-		}
-		var out strings.Builder
-		prev := 0
-		replaced := false
-		for _, u := range uses {
-			tail := cur[u[0]:]
-			if m := ar.FindStringIndex(tail); m != nil && m[0] == 0 {
-				after := tail[m[1]:]
-				if len(after) == 0 || (after[0] != '=' && after[0] != '>') {
-					continue // deklarasi/assignment — pertahankan
-				}
-			}
-			inTpl := u[0] >= 2 && cur[u[0]-2] == '$' && cur[u[0]-1] == '{'
-			pi := u[0] - 1
-			for pi >= 0 && isWS(cur[pi]) {
-				pi--
-			}
-			ni := u[1]
-			for ni < len(cur) && isWS(cur[ni]) {
-				ni++
-			}
-			atEnd := ni >= len(cur)
-			nextIsKey := !atEnd && (cur[ni] == ':' || cur[ni] == '=' || cur[ni] == '(')
-			okPos := inTpl
-			if !okPos && pi >= 0 && !atEnd {
-				pc := cur[pi]
-				if pc == ':' || pc == '=' || pc == '(' || pc == '[' || pc == '!' || pc == ';' || pc == '?' || pc == '|' || pc == '&' || pc == ',' || pc == '{' {
-					if (pc == ',' || pc == '{') && !inArrCtx(cur, pi) {
-						// shorthand {n} / {a,n} — lewati; [a,n] / f(a,n) lanjut.
-					} else if !nextIsKey {
-						okPos = true
-					}
-				}
-			} else if !okPos && pi >= 0 && atEnd {
-				pc := cur[pi]
-				if pc == ':' || pc == '=' || pc == '(' || pc == '[' || pc == '!' || pc == ';' || pc == '?' || pc == '|' || pc == '&' {
-					okPos = true
-				}
-			}
-			if !okPos {
-				continue
-			}
-			if inTpl && u[1] < len(cur) && cur[u[1]] == '}' {
-				// ${NAME} -> nilai telanjang TANPA braces (agar pola URL absolut
-				// langsung match; braces tak membawa info endpoint pasca-substitusi).
-				rep := d.lit
-				if len(rep) >= 2 && ((rep[0] == '"' && rep[len(rep)-1] == '"') ||
-					(rep[0] == '\'' && rep[len(rep)-1] == '\'')) {
-					rep = rep[1 : len(rep)-1]
-				}
-				out.WriteString(cur[prev:u[0]-2])
-				out.WriteString(rep)
-				prev = u[1] + 1
-				replaced = true
-				continue
-			}
-			out.WriteString(cur[prev:u[0]])
-			rep := d.lit
-			if inTpl {
-				// di dalam ${}: substitusi nilai tanpa quote pembungkus.
-				if len(rep) >= 2 && ((rep[0] == '"' && rep[len(rep)-1] == '"') ||
-					(rep[0] == '\'' && rep[len(rep)-1] == '\'')) {
-					rep = rep[1 : len(rep)-1]
-				}
-			}
-			out.WriteString(rep)
-			prev = u[1]
-			replaced = true
-		}
-		if !replaced {
-			continue
-		}
-		out.WriteString(cur[prev:])
-		cur = out.String()
-		changed = true
+	if validate != nil && !validate(raw) {
+		return false
 	}
-	if !changed {
-		return s
+	if x.ck == ckHTML {
+		switch htmlTagAt(c, s) {
+		case "base", "link", "script", "img", "meta":
+			return false // <base href> = base dokumen; <link>/<script>/<img> = aset
+		}
 	}
-	return cur
+	raw = normaliseTemplateURL(raw)
+	if len(raw) < 2 || !validCandidate(raw, kind) {
+		return false
+	}
+	abs, pageRel, rel := x.resolve(raw, kind)
+	if abs == "" {
+		return false
+	}
+	if strings.Contains(abs, "://") {
+		u, err := url.Parse(abs)
+		if err != nil || u.Host == "" {
+			return false
+		}
+		switch strings.ToLower(u.Scheme) {
+		case "http", "https", "ws", "wss":
+		default:
+			return false
+		}
+		if nextInternalPages[u.Path] {
+			return false
+		}
+	}
+	if !x.o.IncludeAssets {
+		// PageRel: host-nya bisa diganti (CDN -> origin app) -> cek host di akhir.
+		if isStaticExt(abs) || (!pageRel && isStaticHost(extractHost(abs))) {
+			return false
+		}
+	}
+	if !x.o.IncludeExternal {
+		if !sameSite(extractHost(x.effBase), extractHost(abs)) {
+			x.skippedExt[strings.ToLower(abs)] = true
+			return false
+		}
+	}
+
+	// ── method & params dari konteks ──
+	var ci ctxInfo
+	q := s - 1
+	quoted := q >= 0 && (c[q] == '"' || c[q] == '\'' || c[q] == '`')
+	switch {
+	case !quoted:
+	case kind == kConfig:
+		ci = analyzeObject(c, q)
+	case kind == kRoute || kind == kHTML || kind == kModule:
+	default:
+		if open := callOpenBefore(c, q); open >= 0 {
+			style := args
+			if style == argNone && (kind == kLiteral || kind == kAbs) {
+				style = argOptions
+			}
+			ci = analyzeCall(c, open, style, method)
+		}
+	}
+	if !explicit && ci.method != "" {
+		method, explicit = ci.method, true
+	}
+	if !explicit {
+		if vm, ok := x.varMethods[strings.ToLower(abs)]; ok {
+			method, explicit = vm, true
+		}
+	}
+	if !explicit {
+		method = strings.ToUpper(pat.DefaultMethod)
+		if method == "" {
+			method = "GET"
+		}
+		if p := strings.ToLower(pathOf(abs)); strings.HasSuffix(p, "/graphql") || strings.HasSuffix(p, "/graphql/") {
+			method, explicit = "POST", true // Apollo/urql default POST
+		}
+	}
+	query, body := ci.query, ci.body
+	if !isBodyMethod(method) {
+		query = append(query, body...)
+		body = nil
+	}
+	params := dedupStrings(append(append(urlParams(raw), query...), body...))
+
+	op := x.nt.orig(s)
+	if x.li == nil {
+		x.li = buildLineIndex(x.orig)
+	}
+	line, col := x.li.lineCol(op)
+	x.eps = append(x.eps, Endpoint{
+		RawURL:         raw,
+		AbsURL:         abs,
+		Method:         method,
+		Params:         params,
+		Source:         fmt.Sprintf("%s:%d:%d", x.o.SourceLabel, line, col),
+		Line:           line,
+		Col:            col,
+		Interest:       scoreInterest(abs),
+		MethodExplicit: explicit,
+		QueryParams:    dedupStrings(query),
+		BodyKeys:       dedupStrings(body),
+		PageRel:        pageRel,
+		RelPath:        rel,
+		PageURL:        x.o.PageURL,
+		pos:            op,
+	})
+	return true
 }
 
-// inArrCtx: posisi koma/kurawal dibuka oleh [ atau ( (bukan { object)).
-func inArrCtx(s string, pos int) bool {
-	depth := 0
-	for j := pos; j >= 0 && j > pos-80; j-- {
-		switch s[j] {
-		case '}', ']', ')':
-			depth++
-		case '{':
-			if depth == 0 {
-				return false
-			}
-			depth--
-		case '[', '(':
-			if depth == 0 {
-				return true
-			}
-			depth--
-		}
+func dedupStrings(xs []string) []string {
+	if len(xs) == 0 {
+		return nil
 	}
-	return false
+	seen := make(map[string]bool, len(xs))
+	var out []string
+	for _, v := range xs {
+		v = strings.TrimSpace(v)
+		if v == "" || len(v) >= 40 || seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	return out
 }
 
-func normaliseContentEP(s string) string {
-	for i := 0; i < 3; i++ {
-		prev := s
-		s = unescapeEP(s)
-		s = joinConcatEP(s)
-		s = evalArrJoinEP(s)
-		s = propagateEP(s)
-		if s == prev {
-			break
-		}
-	}
-	return s
+func mergeParams(dst *Endpoint, src Endpoint) {
+	dst.Params = dedupStrings(append(dst.Params, src.Params...))
+	dst.QueryParams = dedupStrings(append(dst.QueryParams, src.QueryParams...))
+	dst.BodyKeys = dedupStrings(append(dst.BodyKeys, src.BodyKeys...))
 }
 
-func extractEndpoints(content, sourceURL, jsURL, baseOverride string, includeAssets, includeExternal bool) ([]Endpoint, string, int) {
-	// leaktest-2026-10: normalisasi dulu (unescape/join/propagate) agar
-	// pola tetap sederhana; nomor baris dari konten ternormalisasi.
-	content = normaliseContentEP(content)
-	var results []Endpoint
-	seen := make(map[string]bool)
-	skippedExternal := map[string]bool{}
-
-	effectiveBase := baseOverride
-	if effectiveBase == "" {
-		effectiveBase = detectBaseURL(content, jsURL)
+// mergeEndpoints: gabung per URL (urutan masukan dipertahankan = deterministik).
+// Ada method eksplisit -> satu record per method eksplisit (GET default dari
+// literal generik dilebur); tanpa eksplisit -> satu record.
+func mergeEndpoints(eps []Endpoint) []Endpoint {
+	var order []string
+	groups := map[string][]int{}
+	for i := range eps {
+		k := dedupKey(eps[i].AbsURL)
+		if _, ok := groups[k]; !ok {
+			order = append(order, k)
+		}
+		groups[k] = append(groups[k], i)
 	}
-	// deklarasi eksplisit (bukan voting): relatif ikut base tsb (TestInstanceMethodFam).
-	// Rule page-origin hanya untuk base hasil voting statistik.
-	fileHasDeclBase := baseOverride != "" || hasBaseDeclaration(content)
-
-	// Atribusi method dari call-site variabel (override label default).
-	varMethods := resolveVarCallMethods(content, collectVarURLs(content))
-
-	li := buildLineIndex(content)
-	n := len(content)
-
-	for _, pat := range extractionPatterns {
-		for _, loc := range pat.Regex.FindAllStringSubmatchIndex(content, -1) {
-			if len(loc) < (pat.URLGroup+1)*2 {
+	out := make([]Endpoint, 0, len(order))
+	for _, k := range order {
+		idxs := groups[k]
+		hasExplicit := false
+		for _, i := range idxs {
+			if eps[i].MethodExplicit {
+				hasExplicit = true
+				break
+			}
+		}
+		byMethod := map[string]int{}
+		firstOut := -1
+		for _, i := range idxs {
+			e := eps[i]
+			if hasExplicit && !e.MethodExplicit {
 				continue
 			}
-			s, e := loc[pat.URLGroup*2], loc[pat.URLGroup*2+1]
-			if s < 0 || e < 0 {
+			if j, ok := byMethod[e.Method]; ok {
+				mergeParams(&out[j], e)
 				continue
 			}
-			rawURL := strings.TrimSpace(content[s:e])
-			if len(rawURL) < 4 {
-				continue
+			byMethod[e.Method] = len(out)
+			if firstOut < 0 {
+				firstOut = len(out)
 			}
-			if pat.Validate != nil && !pat.Validate(rawURL) {
-				continue
-			}
-			if strings.Contains(rawURL, " ") {
-				continue
-			}
-			if strings.Contains(rawURL, "\\") || strings.HasPrefix(rawURL, "#") {
-				continue
-			}
-
-			rawURL = normaliseTemplateURL(rawURL)
-			baseForRaw := effectiveBase
-			if baseOverride == "" && !fileHasDeclBase && strings.HasPrefix(rawURL, "/") && !strings.HasPrefix(rawURL, "//") && !apiShapedEP(rawURL) {
-				// elected base (voter) hanya untuk relatif beraroma API; leading-/
-				// biasa = page-origin (semantik browser). -base eksplisit selalu menang.
-				// TestBaseResolution js2 (/v1/me -> api) tetap lolos via apiShapedEP.
-				if po := originOf(jsURL); po != "" {
-					baseForRaw = po
+			out = append(out, e)
+		}
+		if hasExplicit {
+			for _, i := range idxs {
+				if !eps[i].MethodExplicit {
+					mergeParams(&out[firstOut], eps[i])
 				}
 			}
-			absURL := resolveURL(rawURL, jsURL, baseForRaw)
-
-			if !includeAssets && isStaticAsset(absURL) {
-				continue
-			}
-			if !includeExternal {
-				baseHost := extractHost(effectiveBase)
-				absHost := extractHost(absURL)
-				if !sameSite(baseHost, absHost) {
-					skippedExternal[strings.ToLower(absURL)] = true
-					continue
-				}
-			}
-
-			dk := dedupKey(absURL)
-			if seen[dk] {
-				continue
-			}
-			seen[dk] = true
-
-			method := strings.ToUpper(pat.DefaultMethod)
-			if pat.MethodGroup > 0 && len(loc) >= (pat.MethodGroup+1)*2 {
-				ms, me := loc[pat.MethodGroup*2], loc[pat.MethodGroup*2+1]
-				if ms >= 0 && me >= 0 {
-					method = strings.ToUpper(content[ms:me])
-				}
-			}
-			if !validHTTPMethod(method) {
-				method = strings.ToUpper(pat.DefaultMethod)
-			}
-			// Override hanya bila situs literal tak memberi info eksplisit
-			// (method == DefaultMethod): call-site variabel lebih tahu.
-			if method == strings.ToUpper(pat.DefaultMethod) {
-				if vm, ok := varMethods[strings.ToLower(absURL)]; ok && validHTTPMethod(vm) {
-					method = vm
-				}
-			}
-
-			// v2: konteks = window karakter di sekitar match (bukan ±3 baris).
-			// Mencegah blowup pada JS minified (dulu konteks = seluruh file per match).
-			cs := s - ctxWindow
-			if cs < 0 {
-				cs = 0
-			}
-			ce := e + ctxWindow
-			if ce > n {
-				ce = n
-			}
-			params := extractParams(rawURL, []string{content[cs:ce]})
-
-			lineNum := li.lineAt(s)
-			results = append(results, Endpoint{
-				RawURL:   rawURL,
-				AbsURL:   absURL,
-				Method:   method,
-				Params:   params,
-				Source:   fmt.Sprintf("%s:%d", sourceURL, lineNum),
-				Line:     lineNum,
-				Interest: scoreInterest(absURL),
-			})
 		}
 	}
-	return results, effectiveBase, len(skippedExternal)
+	return out
 }
 
 func extractHost(rawURL string) string {
@@ -1166,7 +1335,39 @@ func sameSite(baseHost, absHost string) bool {
 	return strings.HasSuffix(absHost, "."+baseHost)
 }
 
-// sameSLD kept for compat (unused by filter logic).
-func sameSLD(a, b string) bool {
-	return sameSite(a, b)
+// ─── Known URL Normalisation ──────────────────────────────────────────────────
+
+// hostKey: hostname lowercase + port non-default (443/80 dibuang).
+func hostKey(u *url.URL) string {
+	h := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
+	switch p := u.Port(); p {
+	case "", "80", "443":
+		return h
+	default:
+		return h + ":" + p
+	}
+}
+
+// normaliseForFilter: kunci -k level host+path (skema/query/fragment/trailing
+// slash/port default diabaikan). Baris tanpa skema ("example.com/x") ikut.
+func normaliseForFilter(rawURL string) string {
+	raw := strings.TrimSpace(rawURL)
+	if !strings.Contains(raw, "://") && !strings.HasPrefix(raw, "/") {
+		hostPart := raw
+		if i := strings.IndexAny(raw, "/?#"); i >= 0 {
+			hostPart = raw[:i]
+		}
+		if strings.Contains(hostPart, ".") {
+			raw = "http://" + raw
+		}
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return strings.ToLower(strings.TrimRight(raw, "/"))
+	}
+	p := strings.TrimRight(u.EscapedPath(), "/")
+	if p == "" {
+		p = "/"
+	}
+	return hostKey(u) + fixBraces(p)
 }
