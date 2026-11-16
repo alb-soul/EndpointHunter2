@@ -91,7 +91,7 @@ endpoint-hunter2 -js app.js --out-prefix out    # out.txt + out.jsonl + out.curl
 | Flag | Description |
 | --- | --- |
 | `-l, -list` | File with URLs to scan |
-| `-k, -known` | Extra known-endpoints file to filter (host+path, case-insensitive) |
+| `-k, -known` | Extra known-endpoints file to filter: full URL, or host+path (host case-insensitive, path case-sensitive; scheme, query, trailing `/`, default port ignored; `host/path` lines without scheme and `url [200]` lines accepted) |
 | `-js` | Local JS file to analyze |
 | `--httpx-json` | JSONL from `httpx -json -irr` (body-reuse, no fetch). `-` = stdin |
 | `-b, -base` | Base URL override for resolving relative paths |
@@ -102,32 +102,38 @@ endpoint-hunter2 -js app.js --out-prefix out    # out.txt + out.jsonl + out.curl
 | `--rate` | Max requests/second (0 = unlimited) |
 | `--delay` | ms delay between requests (used only when `--rate` is off) |
 | `--flaresolverr` | FlareSolverr URL for Cloudflare/403 handling |
-| `-H, -header` | Extra HTTP header (repeatable) |
+| `-H, -header` | Extra HTTP header `"Name: value"` (repeatable). Sent on every request incl. redirect hops; several `Cookie:` are merged; `Host:` sets the request host; malformed values are reported on stderr |
 | `--timeout` | Request timeout seconds (default 7) |
-| `-ua` | Custom User-Agent |
-| `--include-assets` | Include static asset URLs (JS/CSS/images) |
+| `-ua` | Custom User-Agent (explicit `-ua` wins over FlareSolverr's UA; `-H "User-Agent: x"` wins over both) |
+| `--include-assets` | Include static asset URLs (JS/CSS/images) plus dynamic `import()` chunks and `sourceMappingURL` |
 | `--include-external` | On by default (redundan; tetap diterima). `--include-external=false` = perilaku strict lama |
 | `--urls-only` | Plain URLs, one per line |
 | `--json` | JSON output |
 | `--curl` | Curl command output |
 | `--body-format` | `json` \| `form` \| `both` (default `json`) |
 | `--fuzz` | Replace `{param}` with `FUZZ` |
-| `--out-prefix` | Write `<p>.txt` + `<p>.jsonl` + `<p>.curl.sh` in one run |
-| `-o, -output` | Write chosen output to a file |
+| `--out-prefix` | Write `<p>.txt` (unique absolute URLs) + `<p>.jsonl` (one record per url+method: `url, method, params[], body_params[], interest, source "file:line:col"`) + `<p>.curl.sh` |
+| `-o, -output` | Write output to a file (always written, even when empty). Default/`--urls-only` mode: one absolute URL per line; `--json`/`--curl`: that format |
+| `-version` | Print version |
 | `-silent` | No banner/progress |
 | `-v, -verbose` | Verbose logs (fetch + base URL detection) |
 | `--no-color`, `--no-source` | Tweak display |
 
 ## How It Works
 
-1. **Input** — URL list, local JS file, stdin, or httpx-json JSONL (fed to a worker pool).
+1. **Input** — URL list, local JS file, stdin, or httpx-json JSONL (streamed; a line too large is skipped and reported instead of stopping the read; bodies are capped at 10 MB; binary `content_type` records are skipped; `final_url` is used as the resolution base when present).
 2. **Fetch** *(fetch mode only)* — shared keep-alive transport, redirect cap, FlareSolverr cookie session cache with re-solve on 403/429, response body capped at 10 MB.
-3. **Extract** — a fixed set of hoisted regexes scans the whole content once per pattern; matches are de-duplicated, resolved against auto-detected base URL, and filtered (static assets / external hosts / scope / known endpoints).
-4. **Enrich** — params are pulled from a 500-char window around each match; `{param}`, `/:id` become FUZZ targets; body params attached for non-GET.
-5. **Output** — ranked by interest, deduped globally, emitted in the requested format.
+3. **Normalize** — safe unescape (`\xHH`, `\uHHHH`; `\/` only inside URL string literals in JS, everywhere in JSON; quotes/newlines are never decoded), HTML entities, `"a"+"b"` joins, one-hop constant propagation, and route reconstruction (`"/api/"+id+"/x"`, `"".concat(e,"/x/")`, `` `${a.id}` `` → `/api/{id}/x`). A position map keeps `source` line:col pointing at the original body.
+4. **Extract** — each pattern looks for cheap literal anchors (`strings.Index`) and runs an anchored regex only at those positions. Resolution per finding: HTML → document base (`<base href>`); axios/instance calls → declared `baseURL` (axios-style path join); routes/navigation → page origin; relative paths in JS → application origin (not the JS file's directory), and when the JS is on a CDN, re-attributed to the origin of the HTML page that loads it via `<script src>` in the same input. With `--scope`, an out-of-scope declared/voted base is ignored.
+5. **Method & params** — taken only from the call or config object holding the URL (`fetch(url,{method,body})`, `axios.post(url,data,cfg)`, `$.ajax({url,type,data})`, `<form method>`), so params do not leak between calls. Query keys (`params:`) stay in the query; body keys go to `body_params` for body methods.
+6. **Output** — merged deterministically (input order); one record per explicit method; ranked by interest (token-based: `devices` ≠ `dev`).
+
+Exit codes: `0` success (also when nothing is found), `1` input/output error, `130` interrupted (partial results are still written).
 
 ## Notes
 
 - Proxy via `HTTP_PROXY`/`HTTPS_PROXY` env is honored (`ProxyFromEnvironment`).
 - Start-of-line comments (`#`) in list files are skipped.
 - Not a crawler — feed it pages and JS files; for crawling pair it with a spider (katana, gau, waybackurls, etc.).
+- FlareSolverr's own solve request goes from its browser and cannot carry `-H` identity headers; requests made by endpoint-hunter2 always do.
+- Regression corpus: `python3 testdata/corpus/gen.py`, run with `--httpx-json testdata/corpus/corpus.jsonl --scope example.com --include-external -k testdata/corpus/known.txt --out-prefix out`, then `python3 testdata/corpus/compare.py out`.
