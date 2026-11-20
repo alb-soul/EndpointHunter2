@@ -371,7 +371,7 @@ func detectElectedBase(content string, inScope func(string) bool) string {
 		if isNoisyHost(host) {
 			continue
 		}
-		if inScope != nil && !inScope(strings.Split(host, ":")[0]) {
+		if inScope != nil && !inScope(hostOnly(host)) {
 			continue
 		}
 		fullURL := m[0]
@@ -1339,7 +1339,7 @@ func sameSite(baseHost, absHost string) bool {
 
 // hostKey: hostname lowercase + port non-default (443/80 dibuang).
 func hostKey(u *url.URL) string {
-	h := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
+	h := urlHost(strings.TrimSuffix(strings.ToLower(u.Hostname()), "."))
 	switch p := u.Port(); p {
 	case "", "80", "443":
 		return h

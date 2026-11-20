@@ -577,7 +577,7 @@ func scopeChecker(cfg *Config, scopeSrc string) func(string) bool {
 	if cfg.Scope == "" && !cfg.ScopeExact.set && !(cfg.BaseScope && scopeSrc != "") {
 		return nil
 	}
-	return func(h string) bool { return passScopeFilter(cfg, "https://"+h+"/", scopeSrc) }
+	return func(h string) bool { return passScopeFilter(cfg, "https://"+urlHost(h)+"/", scopeSrc) }
 }
 
 func processItem(cfg *Config, item WorkItem, known *KnownSet) recResult {
@@ -812,12 +812,35 @@ func normScopeArg(s string) string {
 	if i := strings.LastIndex(s, "@"); i >= 0 {
 		s = s[i+1:]
 	}
-	if i := strings.LastIndex(s, ":"); i >= 0 && !strings.Contains(s, "]") {
+	return strings.TrimSuffix(strings.TrimPrefix(hostOnly(s), "*."), ".")
+}
+
+// hostOnly: buang port & kurung IPv6 — "[::1]:80"->"::1", "h:80"->"h".
+// IPv6 polos ("::1", "2001:db8::1") TIDAK dipotong: dulu ":1" dianggap port →
+// scope ":" → semua endpoint target IPv6 terbuang.
+func hostOnly(s string) string {
+	s = strings.TrimSpace(s)
+	if strings.HasPrefix(s, "[") {
+		if i := strings.Index(s, "]"); i > 0 {
+			return s[1:i]
+		}
+		return strings.Trim(s, "[]")
+	}
+	if strings.Count(s, ":") == 1 {
+		i := strings.LastIndex(s, ":")
 		if _, err := strconv.Atoi(s[i+1:]); err == nil {
-			s = s[:i]
+			return s[:i]
 		}
 	}
-	return strings.TrimSuffix(strings.TrimPrefix(s, "*."), ".")
+	return s
+}
+
+// urlHost: host untuk disisipkan ke URL — IPv6 wajib ber-kurung.
+func urlHost(h string) string {
+	if strings.Contains(h, ":") && !strings.HasPrefix(h, "[") {
+		return "[" + h + "]"
+	}
+	return h
 }
 
 func readURLList(r io.Reader, into *[]string) error {
@@ -1306,13 +1329,7 @@ var twoPartPublicSuffix = map[string]bool{
 // registrableDomain: aproksimasi (api.apps.binus.ac.id -> binus.ac.id).
 // IP/v6 kembali utuh, port dibuang.
 func registrableDomain(host string) string {
-	h := strings.ToLower(strings.TrimSuffix(host, "."))
-	if i := strings.LastIndex(h, ":"); i >= 0 && !strings.Contains(h[i:], "]") {
-		if _, err := strconv.Atoi(h[i+1:]); err == nil {
-			h = h[:i]
-		}
-	}
-	h = strings.Trim(h, "[]")
+	h := strings.TrimSuffix(hostOnly(strings.ToLower(host)), ".")
 	if strings.Contains(h, ":") {
 		return h // IPv6 -> utuh
 	}
@@ -1374,7 +1391,7 @@ func (v *exactScopeValue) Set(s string) error {
 func (v *exactScopeValue) IsBoolFlag() bool { return true }
 
 func normScopeHost(scope string) string {
-	return strings.ToLower(strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(scope), "*."), "."))
+	return strings.ToLower(strings.TrimSuffix(strings.TrimPrefix(hostOnly(scope), "*."), "."))
 }
 
 // passScopeFilter: default luas (tanpa flag scope -> semua lolos).
