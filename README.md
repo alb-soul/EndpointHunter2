@@ -21,13 +21,27 @@
 
 ## Install / Build
 
+Requirements: Go 1.21+ (the version in `go.mod`). Pure Go standard library — no Chromium or headless browser is needed; Cloudflare-protected targets go through FlareSolverr (`--flaresolverr`).
+
 ```bash
-# in project dir (main.go + extractor.go + enrich.go + go.mod)
-go build -o endpoint-hunter2 .
-go vet ./...
+git clone https://github.com/alb-soul/EndpointHunter2.git
+cd EndpointHunter2
+./install.sh
 ```
 
-Requirements: Go 1.21+.
+`install.sh` builds the binary from the repo (`go build -trimpath`, static, `CGO_ENABLED=0`) and installs a **copy** (not a symlink) to `/usr/local/bin/endpoint-hunter2`, using `sudo` only when that directory isn't writable. It never installs Go, downloads anything, or edits `PATH`/shell rc files.
+
+- Other location: `BINDIR=$HOME/.local/bin ./install.sh` (or `PREFIX=/opt/tools ./install.sh` → `/opt/tools/bin`).
+- Update: `git pull && ./install.sh`
+- Remove: `./install.sh --uninstall` (removes only `$BINDIR/endpoint-hunter2`).
+- An existing symlink at the destination is replaced by a regular file. If another `endpoint-hunter2` earlier in `PATH` shadows the installed one, the installer warns and lists every copy so you can delete the stale ones yourself.
+
+Manual build for development:
+
+```bash
+go build -o endpoint-hunter2 .
+go vet ./... && go test ./...
+```
 
 ## Usage
 
