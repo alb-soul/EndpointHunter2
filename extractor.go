@@ -1197,12 +1197,12 @@ func (x *extractor) emit(pat *ExtractionPattern, kind patKind, args argStyle, va
 			method, explicit = "POST", true // Apollo/urql default POST
 		}
 	}
+	// params = nama query string URL + placeholder path + kunci query dari
+	// konteks (axios params:, $.get GET). Kunci body (JSON.stringify({..}),
+	// data:, FormData) HANYA di BodyKeys -> body_params; dulu ikut disalin ke
+	// params (POST /graphql -> params:["query"]).
 	query, body := ci.query, ci.body
-	if !isBodyMethod(method) {
-		query = append(query, body...)
-		body = nil
-	}
-	params := dedupStrings(append(append(urlParams(raw), query...), body...))
+	params := dedupStrings(append(urlParams(raw), query...))
 
 	op := x.nt.orig(s)
 	if x.li == nil {

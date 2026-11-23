@@ -190,7 +190,7 @@ func TestKnownFilterPort(t *testing.T) {
 }
 
 func TestEnrichBody(t *testing.T) {
-	ep := Endpoint{AbsURL: "https://example.com/api/users/{id}?verbose=", Method: "POST", Params: []string{"name", "verbose", "id"}}
+	ep := Endpoint{AbsURL: "https://example.com/api/users/{id}?verbose=", Method: "POST", Params: []string{"verbose", "id"}, BodyKeys: []string{"name"}}
 	e := enrichEndpoint(ep)
 	if !strings.Contains(e.URL, "/users/FUZZ") {
 		t.Errorf("path placeholder not fuzzed: %s", e.URL)
@@ -514,8 +514,11 @@ func TestBodyJSONStringifyParams(t *testing.T) {
 		if e.AbsURL != "https://app.x/api/update" {
 			continue
 		}
-		if !stringIn(e.Params, "email") || !stringIn(e.Params, "role") {
-			t.Errorf("body params missing: %v", e.Params)
+		if !stringIn(e.BodyKeys, "email") || !stringIn(e.BodyKeys, "role") {
+			t.Errorf("body params missing: %v", e.BodyKeys)
+		}
+		if stringIn(e.Params, "email") || stringIn(e.Params, "role") {
+			t.Errorf("body keys leaked into params: %v", e.Params)
 		}
 		return
 	}

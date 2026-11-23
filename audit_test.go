@@ -110,8 +110,11 @@ func TestParamsNoLeak(t *testing.T) {
 		t.Errorf("params leaked into /api/a: %v", a.Params)
 	}
 	b := mustHave(t, m, "https://app.example.com/api/b", "POST")
-	if !stringIn(b.Params, "secret") || !stringIn(b.Params, "token") {
-		t.Errorf("body params missing: %v", b.Params)
+	if !stringIn(b.BodyKeys, "secret") || !stringIn(b.BodyKeys, "token") {
+		t.Errorf("body params missing: %v", b.BodyKeys)
+	}
+	if len(b.Params) != 0 {
+		t.Errorf("body keys leaked into params: %v", b.Params)
 	}
 }
 
@@ -135,7 +138,7 @@ func TestMethodAndBodyFromCallArgs(t *testing.T) {
 	mustHave(t, m, "https://app.example.com/api/beacon", "POST")
 	mustHave(t, m, "https://app.example.com/graphql", "POST")
 	// enrich: query keys tetap di URL walau method POST
-	e := enrichEndpoint(Endpoint{AbsURL: "https://x/api/p", Method: "POST", Params: []string{"page", "name"}, QueryParams: []string{"page"}})
+	e := enrichEndpoint(Endpoint{AbsURL: "https://x/api/p", Method: "POST", Params: []string{"page"}, QueryParams: []string{"page"}, BodyKeys: []string{"name"}})
 	if !strings.Contains(e.URL, "page=FUZZ") || len(e.Body) != 1 || e.Body[0] != "name" {
 		t.Errorf("enrich split wrong: %s %v", e.URL, e.Body)
 	}

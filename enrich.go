@@ -53,15 +53,14 @@ func enrichBraceTokens(s string) []string {
 //   - Path placeholders ({id}, /:id) always become FUZZ.
 //   - Empty query values (?x=), JS-template junk (?x=${..}), and {placeholder}
 //     query values become FUZZ; concrete values (?service=CSW) are kept.
-//   - GET-like methods: leftover params are appended to the query string.
-//   - Body methods (POST/PUT/PATCH/DELETE): leftover params go to .Body instead.
+//   - Leftover params (query names not yet in the URL, e.g. axios params:)
+//     are appended to the query string.
+//   - .Body = ep.BodyKeys (keys of the request body), never ep.Params.
 func enrichEndpoint(ep Endpoint) Enriched {
 	u, err := url.Parse(ep.AbsURL)
 	if err != nil {
 		return Enriched{URL: applyFuzz(ep.AbsURL)}
 	}
-	bodyMethod := isBodyMethod(ep.Method)
-
 	covered := map[string]bool{}
 	for _, t := range enrichBraceTokens(u.Path) {
 		covered[t] = true
@@ -100,24 +99,27 @@ func enrichEndpoint(ep Endpoint) Enriched {
 		}
 	}
 
-	// kunci yang pasti query (axios params:, $.get GET) tetap di query walau
-	// method-nya POST; sisanya ke body untuk method ber-body.
-	forceQuery := map[string]bool{}
-	for _, p := range ep.QueryParams {
-		forceQuery[p] = true
-	}
-	var body []string
+	// ep.Params hanya berisi nama query/path (lihat extractor emit): sisa yang
+	// belum ada di URL (axios params:) -> query string. Body dari BodyKeys saja;
+	// dulu body diturunkan dari sisa Params sehingga kunci body harus ikut
+	// disalin ke params.
 	for _, p := range ep.Params {
 		p = strings.TrimSpace(p)
 		if p == "" || covered[p] || qkeys[p] {
 			continue
 		}
-		if bodyMethod && !forceQuery[p] {
-			body = append(body, p)
-		} else {
-			pairs = append(pairs, [2]string{p, fuzzValue})
-			qkeys[p] = true
+		pairs = append(pairs, [2]string{p, fuzzValue})
+		qkeys[p] = true
+	}
+	var body []string
+	seenBody := map[string]bool{}
+	for _, p := range ep.BodyKeys {
+		p = strings.TrimSpace(p)
+		if p == "" || seenBody[p] {
+			continue
 		}
+		seenBody[p] = true
+		body = append(body, p)
 	}
 
 	var qs []string
