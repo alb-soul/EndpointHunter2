@@ -31,14 +31,15 @@ import (
 // ─── Endpoint ─────────────────────────────────────────────────────────────────
 
 type Endpoint struct {
-	RawURL   string
-	AbsURL   string
-	Method   string
-	Params   []string // gabungan semua param (kompat: field "params" jsonl)
-	Source   string   // "<url-sumber>:<line>:<col>"
-	Line     int
-	Col      int
-	Interest string
+	RawURL    string
+	AbsURL    string
+	Method    string
+	Params    []string // nama query string + placeholder path (bukan kunci body)
+	Source    string   // "<url-sumber>:<line>:<col>" (string kompat; ambigu bila host berport)
+	SourceURL string   // <url-sumber> saja (field jsonl "source_url")
+	Line      int
+	Col       int
+	Interest  string
 
 	MethodExplicit bool     // method berasal dari kode (bukan default GET)
 	QueryParams    []string // kunci yang pasti query (axios params:, $.get GET)
@@ -1215,6 +1216,7 @@ func (x *extractor) emit(pat *ExtractionPattern, kind patKind, args argStyle, va
 		Method:         method,
 		Params:         params,
 		Source:         fmt.Sprintf("%s:%d:%d", x.o.SourceLabel, line, col),
+		SourceURL:      x.o.SourceLabel,
 		Line:           line,
 		Col:            col,
 		Interest:       scoreInterest(abs),

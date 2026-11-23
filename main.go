@@ -523,6 +523,17 @@ type Result struct {
 	Body     []string `json:"body_params,omitempty"`
 	Interest string   `json:"interest"`
 	Source   string   `json:"source"`
+	// Terstruktur (opsional): "source" = "<url>:<line>:<col>" ambigu bila URL
+	// sumber berport (http://127.0.0.1:8011:24:12). String "source" tetap.
+	SourceURL string `json:"source_url,omitempty"`
+	Line      int    `json:"line,omitempty"`
+	Col       int    `json:"col,omitempty"`
+}
+
+// toResult: record output (--json / <p>.jsonl) untuk satu endpoint.
+func toResult(ep Endpoint, u string, body []string) Result {
+	return Result{URL: u, Method: ep.Method, Params: ep.Params, Body: body, Interest: ep.Interest,
+		Source: ep.Source, SourceURL: ep.SourceURL, Line: ep.Line, Col: ep.Col}
 }
 
 // ─── Worker ───────────────────────────────────────────────────────────────────
@@ -1247,7 +1258,7 @@ func run() int {
 		results := []Result{}
 		for _, ep := range allFound {
 			e := enrichEndpoint(ep)
-			results = append(results, Result{URL: outURL(ep), Method: ep.Method, Params: ep.Params, Body: e.Body, Interest: ep.Interest, Source: ep.Source})
+			results = append(results, toResult(ep, outURL(ep), e.Body))
 		}
 		data, _ := json.MarshalIndent(results, "", "  ")
 		fmt.Println(string(data))
@@ -1475,7 +1486,7 @@ func writeMultiStream(cfg *Config, eps []Endpoint) error {
 			seen[u] = true
 			urls = append(urls, u)
 		}
-		b, _ := json.Marshal(Result{URL: u, Method: ep.Method, Params: ep.Params, Body: e.Body, Interest: ep.Interest, Source: ep.Source})
+		b, _ := json.Marshal(toResult(ep, u, e.Body))
 		jsonls = append(jsonls, string(b))
 		curls = append(curls, buildCurl(ep, cfg.BodyFormat)...)
 	}
