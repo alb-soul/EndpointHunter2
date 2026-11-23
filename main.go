@@ -38,7 +38,7 @@ import (
 )
 
 const (
-	version   = "2.1.0"
+	version   = "2.1.1"
 	defaultUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 	maxBodyMB = 10
 	// batas satu baris JSONL httpx (-irr memuat body + raw response, ter-escape;
